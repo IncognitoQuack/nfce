@@ -1,0 +1,619 @@
+//@version=6
+// ============================================================================
+// NFCE Strategy [v6] — backtest version of the NSE F&O Confluence Engine
+// Sections 1-9 are copied verbatim from nfce_indicator.pine (generated, do not edit here).
+// Section 10 replaces the indicator's state machine with:
+//   (a) the SAME state machine (variant 0) driving TradingView strategy orders, and
+//   (b) a "shadow ledger" that runs the same state machine for Phase-3 variants
+//       (ablations and a 3-parameter grid) and logs every trade to Pine Logs.
+// Costs: 0.03% per side commission + 4 ticks slippage (report Section 3).
+// Version 2.0 (18 Oct 2026): v2 trade management (see nfce_engine/nfce/engine.py docstring), quantity
+// reconciliation (mmQty), optional golden bar export for the Python parity test. Set "Allow a new entry on the
+// bar a trade exited" = on, "Moved stop can trigger in the same bar" = off, both daily-stop inputs = 0 and the
+// overrides 0 to reproduce the v1 (Phase 2-3) behaviour.
+// Educational tool. Not investment advice. No tested version showed an edge after costs.
+// ============================================================================
+strategy("NFCE Strategy [v6]", shorttitle = "NFCE-S", overlay = true, max_labels_count = 500, max_lines_count = 500, max_bars_back = 1000,
+     initial_capital = 3000000, default_qty_type = strategy.fixed, default_qty_value = 10,
+     commission_type = strategy.commission.percent, commission_value = 0.03, margin_long = 15, margin_short = 15,
+     slippage = 4, process_orders_on_close = true, calc_on_every_tick = false)
+// FIX vs report: margin_long/short = 15 (approx. F&O SPAN+exposure). Pine v6 defaults to 100% margin.
+// FIX vs report: "default_qty" is not a strategy() argument; it is default_qty_value.
+// FIX vs report: on TradingView NSE index futures one contract = one lot (syminfo.pointvalue = lot size),
+// so the report's quantity of 65 meant 65 lots (~1 crore notional) and every order was rejected.
+// 10 lots are used so that 40/30/30 partial exits are whole contracts (4/3/3); capital covers ~15% margin.
+// FIX vs report: process_orders_on_close = true so entries fill at the signal bar's close,
+// which is exactly the indicator's Entry price. The report's false fills at the next bar's open.
+
+
+// ───────────────────────── 1. INPUTS ─────────────────────────
+const string G1 = "1 · Instrument & preset"
+instrIn    = input.string("Auto", "Instrument", options = ["Auto", "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "STOCK"], tooltip = "Auto = from the chart symbol (futures or spot)", group = G1)
+// FIX v2 (found in the v2 TradingView run): the fixed "NIFTY" default silently applied Nifty's weekly expiry and
+// heavyweights on a BANKNIFTY chart. "Auto" reads the chart's root symbol.
+rootSym    = syminfo.root == "CNXFINANCE" ? "FINNIFTY" : syminfo.root == "NIFTY_MID_SELECT" ? "MIDCPNIFTY" : syminfo.root
+instr      = instrIn != "Auto" ? instrIn : rootSym == "NIFTY" or rootSym == "BANKNIFTY" or rootSym == "FINNIFTY" or rootSym == "MIDCPNIFTY" or rootSym == "SENSEX" ? rootSym : "STOCK"
+tfPreset   = input.string("Auto", "Timeframe preset", options = ["Auto", "1m", "3m", "5m", "15m"], group = G1)
+minScoreIn = input.int(0, "Min score override (0 = preset)", minval = 0, maxval = 100, group = G1)
+rvolThrIn  = input.float(0, "RVOL threshold override (0 = preset)", minval = 0, step = 0.1, group = G1)   // FIX: added for Phase-3 optimisation
+brkLenIn   = input.int(0, "Breakout length override (0 = preset)", minval = 0, group = G1)               // FIX: added for Phase-3 optimisation
+aPlusScore = input.int(80, "A+ grade threshold", minval = 50, maxval = 100, group = G1)
+futSymIn   = input.string("", "Futures symbol for volume/OI (blank = chart)", tooltip = "e.g. NSE:NIFTY1! when charting NSE:NIFTY spot", group = G1)
+useOI      = input.bool(true, "Use futures open interest", group = G1)
+oiLen      = input.int(3, "OI change lookback (bars)", minval = 1, group = G1)
+
+const string G2 = "2 · Session filters (IST)"
+skipOpen   = input.int(15, "Skip first N minutes after 09:15", minval = 0, group = G2)
+useLunch   = input.bool(true, "Avoid 12:30-13:30", group = G2)
+lastEntry  = input.int(1445, "Last entry time (HHMM)", group = G2)
+sqOff      = input.int(1515, "Square-off time (HHMM)", group = G2)
+expCut     = input.int(1330, "Expiry day: no entries after (HHMM)", group = G2)
+expBoost   = input.int(10, "Expiry day: extra score required", group = G2)
+// FIX v2 (review M03/F-05): a global "force expiry today" switch rewrote every historical bar. Holiday-shifted
+// expiries are now listed as dates, so only those sessions are affected.
+expDatesIn = input.string("", "Extra expiry dates (yyyy-MM-dd, comma-separated)", tooltip = "Holiday-shifted expiries, e.g. 2026-10-19", group = G2)
+maxTrades  = input.int(4, "Max signals per day", minval = 1, group = G2)
+dailyMaxLoss = input.int(2, "Daily stop: losing trades (0 = off)", minval = 0, group = G2)            // FIX v2: spec section 6
+dailyMaxR  = input.float(2.0, "Daily stop: -R for the day (0 = off)", minval = 0, step = 0.5, group = G2)
+allowReentry = input.bool(false, "Allow a new entry on the bar a trade exited", group = G2)          // FIX v2 (F-06)
+intrabarStop = input.bool(true, "Moved stop can trigger in the same bar (close beyond it)", group = G2)   // FIX v2 (H07)
+
+const string G3 = "3 · Volume & filters"
+rvolDays   = input.int(10, "RVOL sessions (time-of-day)", minval = 3, maxval = 20, group = G3)
+zLen       = input.int(20, "Volume z-score length", group = G3)
+reqVol     = input.bool(false, "Require volume surge as hard filter", tooltip = "Off = report spec (volume is only a weighted factor). On = RVOL and z must both reach threshold.", group = G3)   // FIX: optional, default off
+bodyAtr    = input.float(0.5, "Min breakout body (x ATR)", step = 0.1, group = G3)
+chopMax    = input.float(61.8, "Max Choppiness Index", group = G3)
+roomR      = input.float(1.0, "Min room to next level (x R)", step = 0.1, group = G3)
+orMins     = input.int(15, "Opening range (minutes)", group = G3)
+
+const string G4 = "4 · Risk & targets"
+slBufAtr   = input.float(0.1, "SL buffer (x ATR)", step = 0.05, group = G4)
+minRiskAtr = input.float(0.5, "Min risk (x ATR)", step = 0.1, group = G4)
+maxRiskAtr = input.float(2.0, "Max risk (x ATR) - veto above", step = 0.1, group = G4)
+r1m        = input.float(1.0, "T1 (R)", step = 0.25, group = G4)
+r2m        = input.float(2.0, "T2 (R)", step = 0.25, group = G4)
+r3m        = input.float(3.0, "T3 (R)", step = 0.25, group = G4)
+optDelta   = input.float(0.5, "Option delta for premium estimate", step = 0.05, group = G4)
+
+const string G5 = "5 · Context symbols"
+vixSym     = input.symbol("NSE:INDIAVIX", "Volatility index", group = G5)
+vixHi      = input.float(20.0, "High-VIX regime above", group = G5)
+hwAuto     = input.bool(true, "Heavyweights: use the instrument's default list", tooltip = "BANKNIFTY: HDFCBANK, ICICIBANK, SBIN, KOTAKBANK, AXISBANK. FINNIFTY: HDFCBANK, ICICIBANK, AXISBANK, SBIN, BAJFINANCE. Others: the Nifty list. Off = the five symbols below.", group = G5)
+hw1        = input.symbol("NSE:HDFCBANK", "Heavyweight 1", group = G5)
+hw2        = input.symbol("NSE:ICICIBANK", "Heavyweight 2", group = G5)
+hw3        = input.symbol("NSE:RELIANCE", "Heavyweight 3", group = G5)
+hw4        = input.symbol("NSE:INFY", "Heavyweight 4", group = G5)
+hw5        = input.symbol("NSE:BHARTIARTL", "Heavyweight 5", group = G5)
+
+const string G6 = "6 · Score weights"
+wVol = input.float(20, "Volume surge", group = G6)
+wDir = input.float(15, "Directional consistency", group = G6)
+wTr  = input.float(15, "Trend stack (EMA/VWAP)", group = G6)
+wAdx = input.float(10, "ADX/DMI", group = G6)
+wHtf = input.float(10, "Higher timeframe", group = G6)
+wCvd = input.float(5,  "CVD (approx.)", group = G6)
+wOI  = input.float(10, "Futures OI build-up", group = G6)
+wBr  = input.float(10, "Heavyweights", group = G6)
+wVix = input.float(5,  "India VIX", group = G6)
+
+const string G7 = "7 · Display"
+showLv  = input.bool(true, "Show PDH/PDL/CPR/ORB", group = G7)
+showVW  = input.bool(true, "Show VWAP bands", group = G7)
+showTbl = input.bool(true, "Show dashboard", group = G7)
+
+// ───────────────────────── 2. PRESETS ─────────────────────────
+tfMin = timeframe.isminutes ? timeframe.multiplier : 0
+p = tfPreset != "Auto" ? tfPreset : tfMin <= 1 ? "1m" : tfMin <= 3 ? "3m" : tfMin <= 5 ? "5m" : "15m"
+f_p(a, b, c, d) => p == "1m" ? a : p == "3m" ? b : p == "5m" ? c : d
+// FIX v2 (review F-03/M02): spec presets restored. The Phase-3 "stricter" values (5m 75/1.8, 15m 70/1.56) were
+// chosen after looking at the out-of-sample results, so they are not a validated improvement; use the overrides.
+rvolThr  = rvolThrIn > 0 ? rvolThrIn : f_p(2.0, 1.8, 1.5, 1.3)
+zThr     = f_p(2.0, 1.8, 1.5, 1.3)
+brkLen   = brkLenIn > 0 ? brkLenIn : f_p(10, 8, 6, 4)
+swingLen = f_p(5, 5, 4, 3)
+preScore = f_p(75, 70, 65, 60)
+htfTF    = f_p("15", "15", "60", "60")
+adxMin   = f_p(22.0, 20.0, 20.0, 18.0)
+cooldown = f_p(10, 5, 4, 2)
+
+// ───────────────────────── 3. TIME & EXPIRY ─────────────────────────
+const string TZ = "Asia/Kolkata"
+f_hm(x) => math.floor(x / 100) * 60 + x % 100
+minsNow     = hour(time, TZ) * 60 + minute(time, TZ)                 // bar OPEN time
+minsClose   = hour(time_close, TZ) * 60 + minute(time_close, TZ)     // FIX: bar CLOSE time, used for square-off
+minsFromOpen = minsNow - (9 * 60 + 15)
+newDay      = timeframe.change("1D")
+dow         = dayofweek(time, TZ)
+lastWeekOfMonth = month(time + 7 * 86400000, TZ) != month(time, TZ)
+expDow      = instr == "SENSEX" ? dayofweek.thursday : dayofweek.tuesday
+weeklyExp   = (instr == "NIFTY" or instr == "SENSEX") and dow == expDow
+monthlyExp  = dow == expDow and lastWeekOfMonth
+extraExp    = str.length(expDatesIn) > 0 and str.contains(expDatesIn, str.format_time(time, "yyyy-MM-dd", TZ))
+isExpiry    = weeklyExp or monthlyExp or extraExp
+minScore    = (minScoreIn > 0 ? minScoreIn : preScore) + (isExpiry ? expBoost : 0)
+// FIX v2 (review M01): an entry happens at the bar CLOSE, so the last-entry and expiry cut-offs use the close time.
+// The opening skip excludes bars that START in the first N minutes; the lunch filter excludes bars overlapping 12:30-13:30.
+timeOK = minsFromOpen >= skipOpen and minsClose <= f_hm(lastEntry) and not (useLunch and minsNow < 810 and minsClose > 750) and not (isExpiry and minsClose > f_hm(expCut))
+
+// ───────────────────────── 4. DATA REQUESTS (11 of 40) ─────────────────────────
+// FIX v2 (review F-10): on a SPOT index chart (no volume, no OI) the continuous future is used automatically.
+futAuto = instr == "SENSEX" ? "BSE:SENSEX1!" : instr == "STOCK" ? syminfo.prefix + ":" + syminfo.ticker + "1!" : "NSE:" + instr + "1!"
+futSym = futSymIn != "" ? futSymIn : syminfo.type == "index" ? futAuto : syminfo.prefix + ":" + syminfo.ticker
+[fVol, fClose] = request.security(futSym, timeframe.period, [volume, close], ignore_invalid_symbol = true)
+vol   = nz(fVol)
+oiRaw = request.security(futSym + "_OI", timeframe.period, close, ignore_invalid_symbol = true)
+[htfC, htfE] = request.security(syminfo.tickerid, htfTF, [close[1], ta.ema(close, 20)[1]], lookahead = barmerge.lookahead_on)
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead = barmerge.lookahead_on)
+[vixNow, vixChg] = request.security(vixSym, timeframe.period, [close, close - close[5]], ignore_invalid_symbol = true)
+vixPrevD = request.security(vixSym, "D", close[1], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+f_dayChg() =>
+    var float o = na
+    if timeframe.change("1D")
+        o := open
+    (close - o) / o * 100
+hwBank = instr == "BANKNIFTY"
+hwFin  = instr == "FINNIFTY"
+hs1 = hwAuto ? "NSE:HDFCBANK" : hw1
+hs2 = hwAuto ? "NSE:ICICIBANK" : hw2
+hs3 = hwAuto ? (hwBank ? "NSE:SBIN" : hwFin ? "NSE:AXISBANK" : "NSE:RELIANCE") : hw3
+hs4 = hwAuto ? (hwBank ? "NSE:KOTAKBANK" : hwFin ? "NSE:SBIN" : "NSE:INFY") : hw4
+hs5 = hwAuto ? (hwBank ? "NSE:AXISBANK" : hwFin ? "NSE:BAJFINANCE" : "NSE:BHARTIARTL") : hw5
+c1 = request.security(hs1, timeframe.period, f_dayChg(), ignore_invalid_symbol = true)
+c2 = request.security(hs2, timeframe.period, f_dayChg(), ignore_invalid_symbol = true)
+c3 = request.security(hs3, timeframe.period, f_dayChg(), ignore_invalid_symbol = true)
+c4 = request.security(hs4, timeframe.period, f_dayChg(), ignore_invalid_symbol = true)
+c5 = request.security(hs5, timeframe.period, f_dayChg(), ignore_invalid_symbol = true)
+
+// ───────────────────────── 5. LEVELS ─────────────────────────
+pp = (pdh + pdl + pdc) / 3
+bc = (pdh + pdl) / 2
+tc = 2 * pp - bc
+r1 = 2 * pp - pdl
+s1 = 2 * pp - pdh
+var float orH = na
+var float orL = na
+if newDay
+    orH := high
+    orL := low
+else if minsFromOpen >= 0 and minsFromOpen < orMins
+    orH := math.max(orH, high)
+    orL := math.min(orL, low)
+orDone = minsFromOpen >= orMins
+
+// Session VWAP from futures volume (works on spot chart too)
+var float cPV = 0.0
+var float cPV2 = 0.0
+var float cV = 0.0
+if newDay
+    cPV := 0.0
+    cPV2 := 0.0
+    cV := 0.0
+cPV  += hlc3 * vol
+cPV2 += hlc3 * hlc3 * vol
+cV   += vol
+vw   = cV > 0 ? cPV / cV : hlc3
+vwSd = cV > 0 ? math.sqrt(math.max(cPV2 / cV - vw * vw, 0)) : 0.0
+vwU2 = vw + 2 * vwSd
+vwL2 = vw - 2 * vwSd
+
+// ───────────────────────── 6. VOLUME ENGINE ─────────────────────────
+// Ring buffer: one row per session, one column per time-of-day slot.
+// FIX: rvolDays + 1 rows, so the average uses rvolDays PRIOR sessions (the report's code used rvolDays - 1).
+const int MAXSLOT = 400
+var int volRows = rvolDays + 1
+var matrix<float> volM = matrix.new<float>(volRows, MAXSLOT, na)
+var int dayRow = -1
+if newDay
+    dayRow := (dayRow + 1) % volRows
+    for c = 0 to MAXSLOT - 1
+        volM.set(dayRow, c, na)
+slot = int(math.max(0, math.min(MAXSLOT - 1, math.floor(minsFromOpen / math.max(tfMin, 1)))))
+float sumV = 0.0
+int cnt = 0
+if dayRow >= 0
+    for r = 0 to volRows - 1
+        if r != dayRow
+            v = volM.get(r, slot)
+            if not na(v)
+                sumV += v
+                cnt += 1
+    volM.set(dayRow, slot, vol)
+todAvg = cnt >= 3 ? sumV / cnt : na
+smaV   = ta.sma(vol, zLen)
+rvol   = not na(todAvg) and todAvg > 0 ? vol / todAvg : smaV > 0 ? vol / smaV : na   // fallback until 3 sessions stored
+volZ   = (vol - smaV) / ta.stdev(vol, zLen)
+volSurge = nz(rvol) >= rvolThr and nz(volZ) >= zThr
+
+// Approximate cumulative volume delta (close location in range)
+rng = high - low
+bDelta = rng > 0 ? vol * ((close - low) - (high - close)) / rng : 0.0
+var float cvd = 0.0
+cvd := newDay ? bDelta : cvd + bDelta
+cvdSlope = cvd - cvd[3]
+
+// ───────────────────────── 7. TREND & REGIME ─────────────────────────
+atrv = ta.atr(14)
+e9  = ta.ema(close, 9)
+e21 = ta.ema(close, 21)
+e50 = ta.ema(close, 50)
+[diP, diM, adx] = ta.dmi(14, 14)
+[st, stDir] = ta.supertrend(3.0, 10)
+lrSlope = (ta.linreg(close, 20, 0) - ta.linreg(close, 20, 1)) / atrv
+upCnt = math.sum(high > high[1] and low > low[1] ? 1 : 0, 5)
+dnCnt = math.sum(high < high[1] and low < low[1] ? 1 : 0, 5)
+chop = 100 * math.log10(math.sum(ta.atr(1), 14) / (ta.highest(high, 14) - ta.lowest(low, 14))) / math.log10(14)
+[bbM, bbU, bbL] = ta.bb(close, 20, 2.0)
+[kcM, kcU, kcL] = ta.kc(close, 20, 1.5)
+sqzOn = bbU < kcU and bbL > kcL
+htfBull = htfC > htfE
+htfBear = htfC < htfE
+
+// Futures OI build-up (price from futures)
+dPx = fClose - fClose[oiLen]
+dOI = oiRaw - oiRaw[oiLen]
+oiOK = useOI and not na(oiRaw) and not na(dOI)
+oiState = not oiOK ? "n/a" : dPx > 0 and dOI > 0 ? "Long build-up" : dPx < 0 and dOI > 0 ? "Short build-up" : dPx > 0 and dOI < 0 ? "Short covering" : dPx < 0 and dOI < 0 ? "Long unwinding" : "Neutral"
+
+// Heavyweights
+hwUp = (nz(c1) > 0 ? 1 : 0) + (nz(c2) > 0 ? 1 : 0) + (nz(c3) > 0 ? 1 : 0) + (nz(c4) > 0 ? 1 : 0) + (nz(c5) > 0 ? 1 : 0)
+hwDn = (nz(c1) < 0 ? 1 : 0) + (nz(c2) < 0 ? 1 : 0) + (nz(c3) < 0 ? 1 : 0) + (nz(c4) < 0 ? 1 : 0) + (nz(c5) < 0 ? 1 : 0)
+hwN  = (na(c1) ? 0 : 1) + (na(c2) ? 0 : 1) + (na(c3) ? 0 : 1) + (na(c4) ? 0 : 1) + (na(c5) ? 0 : 1)
+expMove = nz(vixPrevD) / 100 / math.sqrt(252) * pdc   // 1-sigma daily move implied by VIX
+
+// ───────────────────────── 8. CONFLUENCE SCORE ─────────────────────────
+f_cap(x) => math.max(0.0, math.min(1.0, nz(x)))
+volPts = f_cap(0.6 * nz(rvol) / rvolThr + 0.4 * nz(volZ) / zThr)
+f_score(a, b, c, d, e, f, g, h, i) =>
+    float num = wVol * a + wDir * b + wTr * c + wAdx * d + wHtf * e + wCvd * f
+    float den = wVol + wDir + wTr + wAdx + wHtf + wCvd
+    if not na(g)
+        num += wOI * g
+        den += wOI
+    if not na(h)
+        num += wBr * h
+        den += wBr
+    if not na(i)
+        num += wVix * i
+        den += wVix
+    den > 0 ? 100 * num / den : 0.0
+
+adxUp = adx > adx[1]
+sL = f_score(close > open ? volPts : 0.0,
+     math.min(upCnt, 3) / 3 * 0.4 + (lrSlope > 0.05 ? 0.3 : 0.0) + (stDir < 0 ? 0.3 : 0.0),
+     (e9 > e21 and e21 > e50 ? 0.5 : e9 > e21 ? 0.25 : 0.0) + (close > vw ? 0.5 : 0.0),
+     adx >= adxMin and diP > diM ? (adxUp ? 1.0 : 0.7) : 0.0,
+     htfBull ? 1.0 : 0.0,
+     cvdSlope > 0 ? 1.0 : 0.0,
+     oiOK ? (oiState == "Long build-up" ? 1.0 : oiState == "Short covering" ? 0.6 : 0.0) : na,
+     hwN > 0 ? hwUp / hwN : na,
+     na(vixChg) ? na : vixChg <= 0 ? 1.0 : vixNow < vixHi ? 0.4 : 0.0)
+sS = f_score(close < open ? volPts : 0.0,
+     math.min(dnCnt, 3) / 3 * 0.4 + (lrSlope < -0.05 ? 0.3 : 0.0) + (stDir > 0 ? 0.3 : 0.0),
+     (e9 < e21 and e21 < e50 ? 0.5 : e9 < e21 ? 0.25 : 0.0) + (close < vw ? 0.5 : 0.0),
+     adx >= adxMin and diM > diP ? (adxUp ? 1.0 : 0.7) : 0.0,
+     htfBear ? 1.0 : 0.0,
+     cvdSlope < 0 ? 1.0 : 0.0,
+     oiOK ? (oiState == "Short build-up" ? 1.0 : oiState == "Long unwinding" ? 0.6 : 0.0) : na,
+     hwN > 0 ? hwDn / hwN : na,
+     na(vixChg) ? na : vixChg >= 0 ? 1.0 : 0.4)
+
+// ───────────────────────── 9. TRIGGERS, FILTERS, RISK ─────────────────────────
+f_nearAbove(px) =>
+    float best = na
+    for lv in array.from(pdh, pdc, r1, tc, pp, bc, orH, vwU2)
+        if not na(lv) and lv > px and (na(best) or lv < best)
+            best := lv
+    best
+f_nearBelow(px) =>
+    float best = na
+    for lv in array.from(pdl, pdc, s1, bc, pp, tc, orL, vwL2)
+        if not na(lv) and lv < px and (na(best) or lv > best)
+            best := lv
+    best
+
+brkHi = ta.highest(high, brkLen)[1]
+brkLo = ta.lowest(low, brkLen)[1]
+bodyOK = math.abs(close - open) >= bodyAtr * atrv
+chopOK = chop < chopMax
+volOK  = not reqVol or volSurge
+
+slLraw = ta.lowest(low, swingLen) - slBufAtr * atrv
+slSraw = ta.highest(high, swingLen) + slBufAtr * atrv
+slL = math.min(slLraw, close - minRiskAtr * atrv)
+slS = math.max(slSraw, close + minRiskAtr * atrv)
+riskL = close - slL
+riskS = slS - close
+nA = f_nearAbove(close)
+nB = f_nearBelow(close)
+roomL = na(nA) or (nA - close) >= roomR * riskL
+roomS = na(nB) or (close - nB) >= roomR * riskS
+
+// ───────────────────────── 10. BACKTEST ENGINE ─────────────────────────
+f_num(x) => str.tostring(x, format.mintick)
+jsSym = str.replace(syminfo.prefix, "_DLY", "") + ":" + syminfo.ticker
+const string G8 = "8 · Backtest"
+lotIn   = input.int(0, "Contracts (0 = 10 lots, needed for 40/30/30 split)", minval = 0, group = G8)
+runVar  = input.bool(true, "Run Phase-3 variants in shadow ledger (logs)", group = G8)
+goldenN = input.int(0, "Golden export: log the last N bars (0 = off)", minval = 0, maxval = 5000, group = G8)
+lotQ = lotIn > 0 ? lotIn : syminfo.pointvalue > 1 ? 10 : instr == "NIFTY" ? 65 : instr == "BANKNIFTY" ? 30 : instr == "FINNIFTY" ? 60 : instr == "MIDCPNIFTY" ? 120 : instr == "SENSEX" ? 20 : 1
+
+// Factor values (identical expressions to the indicator's f_score arguments)
+fdL = math.min(upCnt, 3) / 3 * 0.4 + (lrSlope > 0.05 ? 0.3 : 0.0) + (stDir < 0 ? 0.3 : 0.0)
+ftL = (e9 > e21 and e21 > e50 ? 0.5 : e9 > e21 ? 0.25 : 0.0) + (close > vw ? 0.5 : 0.0)
+faL = adx >= adxMin and diP > diM ? (adxUp ? 1.0 : 0.7) : 0.0
+fhL = htfBull ? 1.0 : 0.0
+fcL = cvdSlope > 0 ? 1.0 : 0.0
+foL = oiOK ? (oiState == "Long build-up" ? 1.0 : oiState == "Short covering" ? 0.6 : 0.0) : na
+fbL = hwN > 0 ? hwUp / hwN : na
+fvL = na(vixChg) ? na : vixChg <= 0 ? 1.0 : vixNow < vixHi ? 0.4 : 0.0
+fdS = math.min(dnCnt, 3) / 3 * 0.4 + (lrSlope < -0.05 ? 0.3 : 0.0) + (stDir > 0 ? 0.3 : 0.0)
+ftS = (e9 < e21 and e21 < e50 ? 0.5 : e9 < e21 ? 0.25 : 0.0) + (close < vw ? 0.5 : 0.0)
+faS = adx >= adxMin and diM > diP ? (adxUp ? 1.0 : 0.7) : 0.0
+fhS = htfBear ? 1.0 : 0.0
+fcS = cvdSlope < 0 ? 1.0 : 0.0
+foS = oiOK ? (oiState == "Short build-up" ? 1.0 : oiState == "Long unwinding" ? 0.6 : 0.0) : na
+fbS = hwN > 0 ? hwDn / hwN : na
+fvS = na(vixChg) ? na : vixChg >= 0 ? 1.0 : 0.4
+
+f_sc(array<float> w, float a, float b, float c, float d, float e, float f, float g, float h, float i) =>
+    float num = w.get(0) * a + w.get(1) * b + w.get(2) * c + w.get(3) * d + w.get(4) * e + w.get(5) * f
+    float den = w.get(0) + w.get(1) + w.get(2) + w.get(3) + w.get(4) + w.get(5)
+    if not na(g)
+        num += w.get(6) * g
+        den += w.get(6)
+    if not na(h)
+        num += w.get(7) * h
+        den += w.get(7)
+    if not na(i)
+        num += w.get(8) * i
+        den += w.get(8)
+    den > 0 ? 100 * num / den : 0.0
+
+// Breakout lengths for the grid: short / preset / long
+bLen0 = math.max(2, int(math.round(brkLen * 0.67)))
+bLen2 = int(math.round(brkLen * 1.33))
+bHi0 = ta.highest(high, bLen0)[1]
+bLo0 = ta.lowest(low, bLen0)[1]
+bHi2 = ta.highest(high, bLen2)[1]
+bLo2 = ta.lowest(low, bLen2)[1]
+
+type Var
+    array<float> w
+    float scoreOff = 0.0
+    float rvMult = 1.0
+    int   brkIdx = 1
+    bool  reqV = false
+    int   abl = -1
+    int   pos = 0
+    float eP = na
+    float sP = na
+    float t1P = na
+    float t2P = na
+    float t3P = na
+    float R = na
+    float rem = 0.0
+    float pnl = 0.0
+    bool  t1Hit = false
+    bool  t2Hit = false
+    int   tradesToday = 0
+    int   lastSig = -100000
+    int   eTime = 0
+    int   eBar = 0
+    float sc = 0.0
+    bool  eExp = false
+    int   n = 0
+    string lg = ""
+    int   lossesToday = 0      // v2: daily stop
+    float rToday = 0.0
+    bool  exitedNow = false    // v2: no same-bar re-entry
+    int   legs = 0             // exit orders, for brokerage
+
+// Same exit rules as the indicator (v2): SL checked first; T1 -> SL to BE; T2 -> SL to T1; T3 / 15:15 -> flat;
+// a moved stop is enforced in the same bar when the close is beyond it. Fills: targets at the target, stops at the
+// stop or at the open if the bar gaps through it, square-off at the bar close. Booking 40% / 30% / rest.
+method manage(Var v) =>
+    string ex = ""
+    v.exitedNow := false
+    if v.pos == 1
+        if low <= v.sP
+            v.pnl += v.rem * (math.min(open, v.sP) - v.eP)
+            v.legs += 1
+            ex := v.t1Hit ? "B" : "S"
+        else
+            bool hit = false
+            if not v.t1Hit and high >= v.t1P
+                v.t1Hit := true
+                v.pnl += 0.4 * (v.t1P - v.eP)
+                v.rem -= 0.4
+                v.sP := v.eP
+                v.legs += 1
+                hit := true
+            if not v.t2Hit and high >= v.t2P
+                v.t2Hit := true
+                v.pnl += 0.3 * (v.t2P - v.eP)
+                v.rem -= 0.3
+                v.sP := v.t1P
+                v.legs += 1
+                hit := true
+            if high >= v.t3P
+                v.pnl += v.rem * (v.t3P - v.eP)
+                v.legs += 1
+                ex := "3"
+            else if hit and intrabarStop and close <= v.sP
+                v.pnl += v.rem * (v.sP - v.eP)
+                v.legs += 1
+                ex := "B"
+    else if v.pos == -1
+        if high >= v.sP
+            v.pnl += v.rem * (v.eP - math.max(open, v.sP))
+            v.legs += 1
+            ex := v.t1Hit ? "B" : "S"
+        else
+            bool hit = false
+            if not v.t1Hit and low <= v.t1P
+                v.t1Hit := true
+                v.pnl += 0.4 * (v.eP - v.t1P)
+                v.rem -= 0.4
+                v.sP := v.eP
+                v.legs += 1
+                hit := true
+            if not v.t2Hit and low <= v.t2P
+                v.t2Hit := true
+                v.pnl += 0.3 * (v.eP - v.t2P)
+                v.rem -= 0.3
+                v.sP := v.t1P
+                v.legs += 1
+                hit := true
+            if low <= v.t3P
+                v.pnl += v.rem * (v.eP - v.t3P)
+                v.legs += 1
+                ex := "3"
+            else if hit and intrabarStop and close >= v.sP
+                v.pnl += v.rem * (v.eP - v.sP)
+                v.legs += 1
+                ex := "B"
+    if v.pos != 0 and ex == "" and (minsClose >= f_hm(sqOff) or newDay)
+        v.pnl += v.rem * v.pos * (close - v.eP)
+        v.legs += 1
+        ex := "Q"
+    if ex != ""
+        v.n += 1
+        float r = v.R > 0 ? v.pnl / v.R : 0.0
+        v.lossesToday += r < 0 ? 1 : 0
+        v.rToday += r
+        v.exitedNow := true
+        v.lg += str.tostring(math.floor(v.eTime / 60000)) + "," + (v.pos == 1 ? "L" : "S") + "," + str.tostring(v.sc, "#") + "," + (v.eExp ? "1" : "0") + "," +
+             f_num(v.eP) + "," + str.tostring(v.R, "#.##") + "," + str.tostring(v.pnl, "#.####") + "," + ex + "," + str.tostring(bar_index - v.eBar) + "," + str.tostring(1 + v.legs) + ";"
+        v.pos := 0
+    ex
+
+method signal(Var v) =>
+    float thr = rvolThr * v.rvMult
+    float vp  = f_cap(0.6 * nz(rvol) / thr + 0.4 * nz(volZ) / zThr)
+    float scL = f_sc(v.w, close > open ? vp : 0.0, fdL, ftL, faL, fhL, fcL, foL, fbL, fvL)
+    float scS = f_sc(v.w, close < open ? vp : 0.0, fdS, ftS, faS, fhS, fcS, foS, fbS, fvS)
+    float mS  = minScore + v.scoreOff
+    float bh  = v.brkIdx == 0 ? bHi0 : v.brkIdx == 2 ? bHi2 : brkHi
+    float bl  = v.brkIdx == 0 ? bLo0 : v.brkIdx == 2 ? bLo2 : brkLo
+    bool surge = nz(rvol) >= thr and nz(volZ) >= zThr
+    bool dayOK = (dailyMaxLoss == 0 or v.lossesToday < dailyMaxLoss) and (dailyMaxR == 0 or v.rToday > -dailyMaxR)
+    bool ok = v.pos == 0 and (allowReentry or not v.exitedNow) and dayOK and timeOK and chopOK and bodyOK and (not v.reqV or surge) and v.tradesToday < maxTrades and bar_index - v.lastSig >= cooldown
+    bool lg = ok and close > bh and close > open and riskL <= maxRiskAtr * atrv and roomL and scL >= mS and scL > scS
+    bool sh = ok and close < bl and close < open and riskS <= maxRiskAtr * atrv and roomS and scS >= mS and scS > scL
+    if lg or sh
+        v.pos := lg ? 1 : -1
+        v.eP := close
+        v.sP := lg ? slL : slS
+        v.R := math.abs(v.eP - v.sP)
+        v.t1P := v.eP + v.pos * r1m * v.R
+        v.t2P := v.eP + v.pos * r2m * v.R
+        v.t3P := v.eP + v.pos * r3m * v.R
+        v.t1Hit := false
+        v.t2Hit := false
+        v.rem := 1.0
+        v.pnl := 0.0
+        v.legs := 0
+        v.tradesToday += 1
+        v.lastSig := bar_index
+        v.eTime := time_close
+        v.eBar := bar_index
+        v.sc := lg ? scL : scS
+        v.eExp := isExpiry
+    [lg, sh]
+
+var array<Var> vars = array.new<Var>()
+if barstate.isfirst
+    baseW = array.from(wVol, wDir, wTr, wAdx, wHtf, wCvd, wOI, wBr, wVix)
+    vars.push(Var.new(w = baseW.copy(), reqV = reqVol))                       // 0: base = indicator
+    if runVar
+        for k = 0 to 8                                                        // 1-9: ablate factor k
+            wk = baseW.copy()
+            wk.set(k, 0.0)
+            vars.push(Var.new(w = wk, reqV = reqVol, abl = k))
+        vars.push(Var.new(w = baseW.copy(), reqV = not reqVol, abl = 9))      // 10: volume hard filter toggled
+        for so in array.from(-10.0, -5.0, 0.0, 5.0, 10.0)                     // 11+: grid
+            for rm in array.from(0.8, 1.0, 1.2)
+                for bi = 0 to 2
+                    vars.push(Var.new(w = baseW.copy(), scoreOff = so, rvMult = rm, brkIdx = bi, reqV = reqVol, abl = -2))
+
+var int t0 = time
+var int mmStateFlat = 0
+var int mmEmuFlat = 0
+var int mmQty = 0
+bool sig0L = false
+bool sig0S = false
+if newDay
+    for v in vars
+        v.tradesToday := 0
+        v.lossesToday := 0
+        v.rToday := 0.0
+
+if barstate.isconfirmed
+    string ex0 = ""
+    for [i, v] in vars
+        ex = v.manage()
+        [lg, sh] = v.signal()
+        if i == 0
+            ex0 := ex
+            sig0L := lg
+            sig0S := sh
+    Var b = vars.get(0)
+    // --- TradingView orders follow variant 0 (= the indicator's state machine) ---
+    if ex0 != "" and strategy.position_size != 0
+        if ex0 != "Q"
+            mmStateFlat += 1      // emulator still holds a position the state machine closed (same-bar SL+target ordering)
+        strategy.close_all(comment = ex0 == "Q" ? "EOD square-off" : "sync to state")
+    if ex0 == "" and b.pos != 0 and not (sig0L or sig0S) and strategy.position_size == 0
+        mmEmuFlat += 1            // emulator flat while state machine still open
+    // FIX v2 (review F-08/M11): quantity reconciliation, not just flat/non-flat: after T1/T2 the emulator must hold
+    // exactly the remaining contracts of the state machine.
+    if ex0 == "" and b.pos != 0 and not (sig0L or sig0S) and strategy.position_size != 0
+        int expQty = lotQ - (b.t1Hit ? math.round(lotQ * 0.4) : 0) - (b.t2Hit ? math.round(lotQ * 0.3) : 0)
+        if math.abs(strategy.position_size) != expQty
+            mmQty += 1
+    if sig0L
+        strategy.entry("L", strategy.long, qty = lotQ)
+    if sig0S
+        strategy.entry("S", strategy.short, qty = lotQ)
+    if b.pos == 1
+        if not b.t1Hit
+            strategy.exit("L-T1", "L", qty_percent = 40, stop = b.sP, limit = b.t1P)
+        if not b.t2Hit
+            strategy.exit("L-T2", "L", qty_percent = 30, stop = b.sP, limit = b.t2P)
+        strategy.exit("L-T3", "L", stop = b.sP, limit = b.t3P)
+    if b.pos == -1
+        if not b.t1Hit
+            strategy.exit("S-T1", "S", qty_percent = 40, stop = b.sP, limit = b.t1P)
+        if not b.t2Hit
+            strategy.exit("S-T2", "S", qty_percent = 30, stop = b.sP, limit = b.t2P)
+        strategy.exit("S-T3", "S", stop = b.sP, limit = b.t3P)
+
+// --- golden export (v2): bar-by-bar inputs and indicator values for the Python engine parity test ---
+f_g(x) => na(x) ? "" : str.tostring(x, "#.######")
+if goldenN > 0 and barstate.isconfirmed and bar_index > last_bar_index - goldenN
+    Var g = vars.get(0)
+    log.info("G|" + str.tostring(time) + "|" + f_g(open) + "|" + f_g(high) + "|" + f_g(low) + "|" + f_g(close) + "|" + f_g(vol) +
+         "|" + f_g(oiRaw) + "|" + f_g(vixNow) + "|" + f_g(vixChg) + "|" + f_g(c1) + "|" + f_g(c2) + "|" + f_g(c3) + "|" + f_g(c4) +
+         "|" + f_g(c5) + "|" + f_g(pdh) + "|" + f_g(pdl) + "|" + f_g(pdc) + "|" + f_g(htfC) + "|" + f_g(htfE) + "|" + f_g(atrv) +
+         "|" + f_g(e9) + "|" + f_g(e21) + "|" + f_g(e50) + "|" + f_g(adx) + "|" + f_g(diP) + "|" + f_g(diM) + "|" + f_g(stDir) +
+         "|" + f_g(rvol) + "|" + f_g(volZ) + "|" + f_g(chop) + "|" + f_g(cvdSlope) + "|" + f_g(vw) + "|" + f_g(sL) + "|" + f_g(sS) +
+         "|" + (sig0L ? "L" : sig0S ? "S" : "") + "|" + str.tostring(g.pos) + "|" + (isExpiry ? "1" : "0"))
+
+plotshape(sig0L, "Long", shape.triangleup, location.belowbar, color.green, size = size.small)
+plotshape(sig0S, "Short", shape.triangledown, location.abovebar, color.red, size = size.small)
+plot(vw, "VWAP", color.orange, 2)
+
+// --- one-time dump of results to Pine Logs on the last bar ---
+var bool dumped = false
+if barstate.islast and not dumped
+    dumped := true
+    log.info("NFCE|META|" + jsSym + "|" + timeframe.period + "|mintick=" + str.tostring(syminfo.mintick) + "|t0=" + str.tostring(math.floor(t0 / 60000)) +
+         "|t1=" + str.tostring(math.floor(time / 60000)) + "|bars=" + str.tostring(bar_index + 1) + "|lot=" + str.tostring(lotQ) + "|pv=" + str.tostring(syminfo.pointvalue) + "|brk=" + str.tostring(bLen0) + "/" + str.tostring(brkLen) + "/" + str.tostring(bLen2) +
+         "|rvolThr=" + str.tostring(rvolThr) + "|minScore=" + str.tostring(preScore) + "|mmStateFlat=" + str.tostring(mmStateFlat) + "|mmEmuFlat=" + str.tostring(mmEmuFlat) +
+         "|mmQty=" + str.tostring(mmQty) + "|ver=2" + "|instr=" + instr + "|intrabar=" + str.tostring(intrabarStop) + "|reentry=" + str.tostring(allowReentry) +
+         "|dailyLoss=" + str.tostring(dailyMaxLoss) + "|dailyR=" + str.tostring(dailyMaxR) +
+         "|tv_trades=" + str.tostring(strategy.closedtrades) + "|tv_net=" + str.tostring(strategy.netprofit, "#.##") + "|tv_gp=" + str.tostring(strategy.grossprofit, "#.##") +
+         "|tv_gl=" + str.tostring(strategy.grossloss, "#.##") + "|tv_wins=" + str.tostring(strategy.wintrades) + "|tv_maxdd=" + str.tostring(strategy.max_drawdown, "#.##"))
+    for [i, v] in vars
+        log.info("NFCE|V|" + str.tostring(i) + "|" + str.tostring(v.abl) + "|" + str.tostring(v.scoreOff) + "|" + str.tostring(v.rvMult) + "|" + str.tostring(v.brkIdx) + "|" + (v.reqV ? "1" : "0") + "|" + str.tostring(v.n) + "|" + v.lg)

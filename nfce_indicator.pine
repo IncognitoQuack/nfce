@@ -1,0 +1,543 @@
+//@version=6
+// ============================================================================
+// NSE F&O Confluence Engine (NFCE) — Pine Script v6
+// Volume surge + directional consistency + false-breakout filters
+// Entry / SL / T1 / T2 / T3, 0-100 confluence score, futures OI build-up,
+// India VIX, heavyweights, CPR/PDH/PDL/ORB, expiry logic, dashboard, alerts.
+// Use on NSE/BSE continuous FUTURES charts (e.g. NSE:NIFTY1!) 1m-15m.
+// Educational tool. Not investment advice. Validate before live use.
+// Changes vs. the report's code are marked "// FIX:"; changes from the independent reviews "// FIX v2".
+// Version 2.0 (18 Oct 2026). Backtests (Phases 2-6) found NO edge after costs: do not trade the labels blindly.
+// ============================================================================
+indicator("NSE F&O Confluence Engine [v6]", shorttitle = "NFCE", overlay = true,
+     max_labels_count = 500, max_lines_count = 500, max_bars_back = 1000)
+
+// ───────────────────────── 1. INPUTS ─────────────────────────
+const string G1 = "1 · Instrument & preset"
+instrIn    = input.string("Auto", "Instrument", options = ["Auto", "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "STOCK"], tooltip = "Auto = from the chart symbol (futures or spot)", group = G1)
+// FIX v2 (found in the v2 TradingView run): the fixed "NIFTY" default silently applied Nifty's weekly expiry and
+// heavyweights on a BANKNIFTY chart. "Auto" reads the chart's root symbol.
+rootSym    = syminfo.root == "CNXFINANCE" ? "FINNIFTY" : syminfo.root == "NIFTY_MID_SELECT" ? "MIDCPNIFTY" : syminfo.root
+instr      = instrIn != "Auto" ? instrIn : rootSym == "NIFTY" or rootSym == "BANKNIFTY" or rootSym == "FINNIFTY" or rootSym == "MIDCPNIFTY" or rootSym == "SENSEX" ? rootSym : "STOCK"
+tfPreset   = input.string("Auto", "Timeframe preset", options = ["Auto", "1m", "3m", "5m", "15m"], group = G1)
+minScoreIn = input.int(0, "Min score override (0 = preset)", minval = 0, maxval = 100, group = G1)
+rvolThrIn  = input.float(0, "RVOL threshold override (0 = preset)", minval = 0, step = 0.1, group = G1)   // FIX: added for Phase-3 optimisation
+brkLenIn   = input.int(0, "Breakout length override (0 = preset)", minval = 0, group = G1)               // FIX: added for Phase-3 optimisation
+aPlusScore = input.int(80, "A+ grade threshold", minval = 50, maxval = 100, group = G1)
+futSymIn   = input.string("", "Futures symbol for volume/OI (blank = chart)", tooltip = "e.g. NSE:NIFTY1! when charting NSE:NIFTY spot", group = G1)
+useOI      = input.bool(true, "Use futures open interest", group = G1)
+oiLen      = input.int(3, "OI change lookback (bars)", minval = 1, group = G1)
+
+const string G2 = "2 · Session filters (IST)"
+skipOpen   = input.int(15, "Skip first N minutes after 09:15", minval = 0, group = G2)
+useLunch   = input.bool(true, "Avoid 12:30-13:30", group = G2)
+lastEntry  = input.int(1445, "Last entry time (HHMM)", group = G2)
+sqOff      = input.int(1515, "Square-off time (HHMM)", group = G2)
+expCut     = input.int(1330, "Expiry day: no entries after (HHMM)", group = G2)
+expBoost   = input.int(10, "Expiry day: extra score required", group = G2)
+// FIX v2 (review M03/F-05): a global "force expiry today" switch rewrote every historical bar. Holiday-shifted
+// expiries are now listed as dates, so only those sessions are affected.
+expDatesIn = input.string("", "Extra expiry dates (yyyy-MM-dd, comma-separated)", tooltip = "Holiday-shifted expiries, e.g. 2026-10-19", group = G2)
+maxTrades  = input.int(4, "Max signals per day", minval = 1, group = G2)
+dailyMaxLoss = input.int(2, "Daily stop: losing trades (0 = off)", minval = 0, group = G2)            // FIX v2: spec section 6
+dailyMaxR  = input.float(2.0, "Daily stop: -R for the day (0 = off)", minval = 0, step = 0.5, group = G2)
+allowReentry = input.bool(false, "Allow a new entry on the bar a trade exited", group = G2)          // FIX v2 (F-06)
+intrabarStop = input.bool(true, "Moved stop can trigger in the same bar (close beyond it)", group = G2)   // FIX v2 (H07)
+
+const string G3 = "3 · Volume & filters"
+rvolDays   = input.int(10, "RVOL sessions (time-of-day)", minval = 3, maxval = 20, group = G3)
+zLen       = input.int(20, "Volume z-score length", group = G3)
+reqVol     = input.bool(false, "Require volume surge as hard filter", tooltip = "Off = report spec (volume is only a weighted factor). On = RVOL and z must both reach threshold.", group = G3)   // FIX: optional, default off
+bodyAtr    = input.float(0.5, "Min breakout body (x ATR)", step = 0.1, group = G3)
+chopMax    = input.float(61.8, "Max Choppiness Index", group = G3)
+roomR      = input.float(1.0, "Min room to next level (x R)", step = 0.1, group = G3)
+orMins     = input.int(15, "Opening range (minutes)", group = G3)
+
+const string G4 = "4 · Risk & targets"
+slBufAtr   = input.float(0.1, "SL buffer (x ATR)", step = 0.05, group = G4)
+minRiskAtr = input.float(0.5, "Min risk (x ATR)", step = 0.1, group = G4)
+maxRiskAtr = input.float(2.0, "Max risk (x ATR) - veto above", step = 0.1, group = G4)
+r1m        = input.float(1.0, "T1 (R)", step = 0.25, group = G4)
+r2m        = input.float(2.0, "T2 (R)", step = 0.25, group = G4)
+r3m        = input.float(3.0, "T3 (R)", step = 0.25, group = G4)
+optDelta   = input.float(0.5, "Option delta for premium estimate", step = 0.05, group = G4)
+
+const string G5 = "5 · Context symbols"
+vixSym     = input.symbol("NSE:INDIAVIX", "Volatility index", group = G5)
+vixHi      = input.float(20.0, "High-VIX regime above", group = G5)
+hwAuto     = input.bool(true, "Heavyweights: use the instrument's default list", tooltip = "BANKNIFTY: HDFCBANK, ICICIBANK, SBIN, KOTAKBANK, AXISBANK. FINNIFTY: HDFCBANK, ICICIBANK, AXISBANK, SBIN, BAJFINANCE. Others: the Nifty list. Off = the five symbols below.", group = G5)
+hw1        = input.symbol("NSE:HDFCBANK", "Heavyweight 1", group = G5)
+hw2        = input.symbol("NSE:ICICIBANK", "Heavyweight 2", group = G5)
+hw3        = input.symbol("NSE:RELIANCE", "Heavyweight 3", group = G5)
+hw4        = input.symbol("NSE:INFY", "Heavyweight 4", group = G5)
+hw5        = input.symbol("NSE:BHARTIARTL", "Heavyweight 5", group = G5)
+
+const string G6 = "6 · Score weights"
+wVol = input.float(20, "Volume surge", group = G6)
+wDir = input.float(15, "Directional consistency", group = G6)
+wTr  = input.float(15, "Trend stack (EMA/VWAP)", group = G6)
+wAdx = input.float(10, "ADX/DMI", group = G6)
+wHtf = input.float(10, "Higher timeframe", group = G6)
+wCvd = input.float(5,  "CVD (approx.)", group = G6)
+wOI  = input.float(10, "Futures OI build-up", group = G6)
+wBr  = input.float(10, "Heavyweights", group = G6)
+wVix = input.float(5,  "India VIX", group = G6)
+
+const string G7 = "7 · Display"
+showLv  = input.bool(true, "Show PDH/PDL/CPR/ORB", group = G7)
+showVW  = input.bool(true, "Show VWAP bands", group = G7)
+showTbl = input.bool(true, "Show dashboard", group = G7)
+
+// ───────────────────────── 2. PRESETS ─────────────────────────
+tfMin = timeframe.isminutes ? timeframe.multiplier : 0
+p = tfPreset != "Auto" ? tfPreset : tfMin <= 1 ? "1m" : tfMin <= 3 ? "3m" : tfMin <= 5 ? "5m" : "15m"
+f_p(a, b, c, d) => p == "1m" ? a : p == "3m" ? b : p == "5m" ? c : d
+// FIX v2 (review F-03/M02): spec presets restored. The Phase-3 "stricter" values (5m 75/1.8, 15m 70/1.56) were
+// chosen after looking at the out-of-sample results, so they are not a validated improvement; use the overrides.
+rvolThr  = rvolThrIn > 0 ? rvolThrIn : f_p(2.0, 1.8, 1.5, 1.3)
+zThr     = f_p(2.0, 1.8, 1.5, 1.3)
+brkLen   = brkLenIn > 0 ? brkLenIn : f_p(10, 8, 6, 4)
+swingLen = f_p(5, 5, 4, 3)
+preScore = f_p(75, 70, 65, 60)
+htfTF    = f_p("15", "15", "60", "60")
+adxMin   = f_p(22.0, 20.0, 20.0, 18.0)
+cooldown = f_p(10, 5, 4, 2)
+
+// ───────────────────────── 3. TIME & EXPIRY ─────────────────────────
+const string TZ = "Asia/Kolkata"
+f_hm(x) => math.floor(x / 100) * 60 + x % 100
+minsNow     = hour(time, TZ) * 60 + minute(time, TZ)                 // bar OPEN time
+minsClose   = hour(time_close, TZ) * 60 + minute(time_close, TZ)     // FIX: bar CLOSE time, used for square-off
+minsFromOpen = minsNow - (9 * 60 + 15)
+newDay      = timeframe.change("1D")
+dow         = dayofweek(time, TZ)
+lastWeekOfMonth = month(time + 7 * 86400000, TZ) != month(time, TZ)
+expDow      = instr == "SENSEX" ? dayofweek.thursday : dayofweek.tuesday
+weeklyExp   = (instr == "NIFTY" or instr == "SENSEX") and dow == expDow
+monthlyExp  = dow == expDow and lastWeekOfMonth
+extraExp    = str.length(expDatesIn) > 0 and str.contains(expDatesIn, str.format_time(time, "yyyy-MM-dd", TZ))
+isExpiry    = weeklyExp or monthlyExp or extraExp
+minScore    = (minScoreIn > 0 ? minScoreIn : preScore) + (isExpiry ? expBoost : 0)
+// FIX v2 (review M01): an entry happens at the bar CLOSE, so the last-entry and expiry cut-offs use the close time.
+// The opening skip excludes bars that START in the first N minutes; the lunch filter excludes bars overlapping 12:30-13:30.
+timeOK = minsFromOpen >= skipOpen and minsClose <= f_hm(lastEntry) and not (useLunch and minsNow < 810 and minsClose > 750) and not (isExpiry and minsClose > f_hm(expCut))
+
+// ───────────────────────── 4. DATA REQUESTS (11 of 40) ─────────────────────────
+// FIX v2 (review F-10): on a SPOT index chart (no volume, no OI) the continuous future is used automatically.
+futAuto = instr == "SENSEX" ? "BSE:SENSEX1!" : instr == "STOCK" ? syminfo.prefix + ":" + syminfo.ticker + "1!" : "NSE:" + instr + "1!"
+futSym = futSymIn != "" ? futSymIn : syminfo.type == "index" ? futAuto : syminfo.prefix + ":" + syminfo.ticker
+[fVol, fClose] = request.security(futSym, timeframe.period, [volume, close], ignore_invalid_symbol = true)
+vol   = nz(fVol)
+oiRaw = request.security(futSym + "_OI", timeframe.period, close, ignore_invalid_symbol = true)
+[htfC, htfE] = request.security(syminfo.tickerid, htfTF, [close[1], ta.ema(close, 20)[1]], lookahead = barmerge.lookahead_on)
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead = barmerge.lookahead_on)
+[vixNow, vixChg] = request.security(vixSym, timeframe.period, [close, close - close[5]], ignore_invalid_symbol = true)
+vixPrevD = request.security(vixSym, "D", close[1], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+f_dayChg() =>
+    var float o = na
+    if timeframe.change("1D")
+        o := open
+    (close - o) / o * 100
+hwBank = instr == "BANKNIFTY"
+hwFin  = instr == "FINNIFTY"
+hs1 = hwAuto ? "NSE:HDFCBANK" : hw1
+hs2 = hwAuto ? "NSE:ICICIBANK" : hw2
+hs3 = hwAuto ? (hwBank ? "NSE:SBIN" : hwFin ? "NSE:AXISBANK" : "NSE:RELIANCE") : hw3
+hs4 = hwAuto ? (hwBank ? "NSE:KOTAKBANK" : hwFin ? "NSE:SBIN" : "NSE:INFY") : hw4
+hs5 = hwAuto ? (hwBank ? "NSE:AXISBANK" : hwFin ? "NSE:BAJFINANCE" : "NSE:BHARTIARTL") : hw5
+c1 = request.security(hs1, timeframe.period, f_dayChg(), ignore_invalid_symbol = true)
+c2 = request.security(hs2, timeframe.period, f_dayChg(), ignore_invalid_symbol = true)
+c3 = request.security(hs3, timeframe.period, f_dayChg(), ignore_invalid_symbol = true)
+c4 = request.security(hs4, timeframe.period, f_dayChg(), ignore_invalid_symbol = true)
+c5 = request.security(hs5, timeframe.period, f_dayChg(), ignore_invalid_symbol = true)
+
+// ───────────────────────── 5. LEVELS ─────────────────────────
+pp = (pdh + pdl + pdc) / 3
+bc = (pdh + pdl) / 2
+tc = 2 * pp - bc
+r1 = 2 * pp - pdl
+s1 = 2 * pp - pdh
+var float orH = na
+var float orL = na
+if newDay
+    orH := high
+    orL := low
+else if minsFromOpen >= 0 and minsFromOpen < orMins
+    orH := math.max(orH, high)
+    orL := math.min(orL, low)
+orDone = minsFromOpen >= orMins
+
+// Session VWAP from futures volume (works on spot chart too)
+var float cPV = 0.0
+var float cPV2 = 0.0
+var float cV = 0.0
+if newDay
+    cPV := 0.0
+    cPV2 := 0.0
+    cV := 0.0
+cPV  += hlc3 * vol
+cPV2 += hlc3 * hlc3 * vol
+cV   += vol
+vw   = cV > 0 ? cPV / cV : hlc3
+vwSd = cV > 0 ? math.sqrt(math.max(cPV2 / cV - vw * vw, 0)) : 0.0
+vwU2 = vw + 2 * vwSd
+vwL2 = vw - 2 * vwSd
+
+// ───────────────────────── 6. VOLUME ENGINE ─────────────────────────
+// Ring buffer: one row per session, one column per time-of-day slot.
+// FIX: rvolDays + 1 rows, so the average uses rvolDays PRIOR sessions (the report's code used rvolDays - 1).
+const int MAXSLOT = 400
+var int volRows = rvolDays + 1
+var matrix<float> volM = matrix.new<float>(volRows, MAXSLOT, na)
+var int dayRow = -1
+if newDay
+    dayRow := (dayRow + 1) % volRows
+    for c = 0 to MAXSLOT - 1
+        volM.set(dayRow, c, na)
+slot = int(math.max(0, math.min(MAXSLOT - 1, math.floor(minsFromOpen / math.max(tfMin, 1)))))
+float sumV = 0.0
+int cnt = 0
+if dayRow >= 0
+    for r = 0 to volRows - 1
+        if r != dayRow
+            v = volM.get(r, slot)
+            if not na(v)
+                sumV += v
+                cnt += 1
+    volM.set(dayRow, slot, vol)
+todAvg = cnt >= 3 ? sumV / cnt : na
+smaV   = ta.sma(vol, zLen)
+rvol   = not na(todAvg) and todAvg > 0 ? vol / todAvg : smaV > 0 ? vol / smaV : na   // fallback until 3 sessions stored
+volZ   = (vol - smaV) / ta.stdev(vol, zLen)
+volSurge = nz(rvol) >= rvolThr and nz(volZ) >= zThr
+
+// Approximate cumulative volume delta (close location in range)
+rng = high - low
+bDelta = rng > 0 ? vol * ((close - low) - (high - close)) / rng : 0.0
+var float cvd = 0.0
+cvd := newDay ? bDelta : cvd + bDelta
+cvdSlope = cvd - cvd[3]
+
+// ───────────────────────── 7. TREND & REGIME ─────────────────────────
+atrv = ta.atr(14)
+e9  = ta.ema(close, 9)
+e21 = ta.ema(close, 21)
+e50 = ta.ema(close, 50)
+[diP, diM, adx] = ta.dmi(14, 14)
+[st, stDir] = ta.supertrend(3.0, 10)
+lrSlope = (ta.linreg(close, 20, 0) - ta.linreg(close, 20, 1)) / atrv
+upCnt = math.sum(high > high[1] and low > low[1] ? 1 : 0, 5)
+dnCnt = math.sum(high < high[1] and low < low[1] ? 1 : 0, 5)
+chop = 100 * math.log10(math.sum(ta.atr(1), 14) / (ta.highest(high, 14) - ta.lowest(low, 14))) / math.log10(14)
+[bbM, bbU, bbL] = ta.bb(close, 20, 2.0)
+[kcM, kcU, kcL] = ta.kc(close, 20, 1.5)
+sqzOn = bbU < kcU and bbL > kcL
+htfBull = htfC > htfE
+htfBear = htfC < htfE
+
+// Futures OI build-up (price from futures)
+dPx = fClose - fClose[oiLen]
+dOI = oiRaw - oiRaw[oiLen]
+oiOK = useOI and not na(oiRaw) and not na(dOI)
+oiState = not oiOK ? "n/a" : dPx > 0 and dOI > 0 ? "Long build-up" : dPx < 0 and dOI > 0 ? "Short build-up" : dPx > 0 and dOI < 0 ? "Short covering" : dPx < 0 and dOI < 0 ? "Long unwinding" : "Neutral"
+
+// Heavyweights
+hwUp = (nz(c1) > 0 ? 1 : 0) + (nz(c2) > 0 ? 1 : 0) + (nz(c3) > 0 ? 1 : 0) + (nz(c4) > 0 ? 1 : 0) + (nz(c5) > 0 ? 1 : 0)
+hwDn = (nz(c1) < 0 ? 1 : 0) + (nz(c2) < 0 ? 1 : 0) + (nz(c3) < 0 ? 1 : 0) + (nz(c4) < 0 ? 1 : 0) + (nz(c5) < 0 ? 1 : 0)
+hwN  = (na(c1) ? 0 : 1) + (na(c2) ? 0 : 1) + (na(c3) ? 0 : 1) + (na(c4) ? 0 : 1) + (na(c5) ? 0 : 1)
+expMove = nz(vixPrevD) / 100 / math.sqrt(252) * pdc   // 1-sigma daily move implied by VIX
+
+// ───────────────────────── 8. CONFLUENCE SCORE ─────────────────────────
+f_cap(x) => math.max(0.0, math.min(1.0, nz(x)))
+volPts = f_cap(0.6 * nz(rvol) / rvolThr + 0.4 * nz(volZ) / zThr)
+f_score(a, b, c, d, e, f, g, h, i) =>
+    float num = wVol * a + wDir * b + wTr * c + wAdx * d + wHtf * e + wCvd * f
+    float den = wVol + wDir + wTr + wAdx + wHtf + wCvd
+    if not na(g)
+        num += wOI * g
+        den += wOI
+    if not na(h)
+        num += wBr * h
+        den += wBr
+    if not na(i)
+        num += wVix * i
+        den += wVix
+    den > 0 ? 100 * num / den : 0.0
+
+adxUp = adx > adx[1]
+sL = f_score(close > open ? volPts : 0.0,
+     math.min(upCnt, 3) / 3 * 0.4 + (lrSlope > 0.05 ? 0.3 : 0.0) + (stDir < 0 ? 0.3 : 0.0),
+     (e9 > e21 and e21 > e50 ? 0.5 : e9 > e21 ? 0.25 : 0.0) + (close > vw ? 0.5 : 0.0),
+     adx >= adxMin and diP > diM ? (adxUp ? 1.0 : 0.7) : 0.0,
+     htfBull ? 1.0 : 0.0,
+     cvdSlope > 0 ? 1.0 : 0.0,
+     oiOK ? (oiState == "Long build-up" ? 1.0 : oiState == "Short covering" ? 0.6 : 0.0) : na,
+     hwN > 0 ? hwUp / hwN : na,
+     na(vixChg) ? na : vixChg <= 0 ? 1.0 : vixNow < vixHi ? 0.4 : 0.0)
+sS = f_score(close < open ? volPts : 0.0,
+     math.min(dnCnt, 3) / 3 * 0.4 + (lrSlope < -0.05 ? 0.3 : 0.0) + (stDir > 0 ? 0.3 : 0.0),
+     (e9 < e21 and e21 < e50 ? 0.5 : e9 < e21 ? 0.25 : 0.0) + (close < vw ? 0.5 : 0.0),
+     adx >= adxMin and diM > diP ? (adxUp ? 1.0 : 0.7) : 0.0,
+     htfBear ? 1.0 : 0.0,
+     cvdSlope < 0 ? 1.0 : 0.0,
+     oiOK ? (oiState == "Short build-up" ? 1.0 : oiState == "Long unwinding" ? 0.6 : 0.0) : na,
+     hwN > 0 ? hwDn / hwN : na,
+     na(vixChg) ? na : vixChg >= 0 ? 1.0 : 0.4)
+
+// ───────────────────────── 9. TRIGGERS, FILTERS, RISK ─────────────────────────
+f_nearAbove(px) =>
+    float best = na
+    for lv in array.from(pdh, pdc, r1, tc, pp, bc, orH, vwU2)
+        if not na(lv) and lv > px and (na(best) or lv < best)
+            best := lv
+    best
+f_nearBelow(px) =>
+    float best = na
+    for lv in array.from(pdl, pdc, s1, bc, pp, tc, orL, vwL2)
+        if not na(lv) and lv < px and (na(best) or lv > best)
+            best := lv
+    best
+
+brkHi = ta.highest(high, brkLen)[1]
+brkLo = ta.lowest(low, brkLen)[1]
+bodyOK = math.abs(close - open) >= bodyAtr * atrv
+chopOK = chop < chopMax
+volOK  = not reqVol or volSurge
+
+slLraw = ta.lowest(low, swingLen) - slBufAtr * atrv
+slSraw = ta.highest(high, swingLen) + slBufAtr * atrv
+slL = math.min(slLraw, close - minRiskAtr * atrv)
+slS = math.max(slSraw, close + minRiskAtr * atrv)
+riskL = close - slL
+riskS = slS - close
+nA = f_nearAbove(close)
+nB = f_nearBelow(close)
+roomL = na(nA) or (nA - close) >= roomR * riskL
+roomS = na(nB) or (close - nB) >= roomR * riskS
+
+// ───────────────────────── 10. TRADE STATE MACHINE ─────────────────────────
+var int   pos = 0
+var float eP = na
+var float sP = na
+var float t1P = na
+var float t2P = na
+var float t3P = na
+var bool  t1Hit = false
+var bool  t2Hit = false
+var int   tradesToday = 0
+var int   lastSig = -100000
+var line  lnE = na
+var line  lnS = na
+var line  ln1 = na
+var line  ln2 = na
+var line  ln3 = na
+// FIX v2: per-trade P&L (40/30/30 weighted, index points) for the daily stop; trade id for alerts.
+var float trPnl = 0.0
+var float rem = 1.0
+var float R0 = na
+var int   lossesToday = 0
+var float rToday = 0.0
+var string tradeId = ""
+bool longSig = false
+bool shortSig = false
+array<string> evs = array.new<string>()
+// FIX: removed the unused helper f_lines (it referenced line history and was never called).
+
+f_num(x) => str.tostring(x, format.mintick)
+// FIX: plain "EXCH:TICKER" (delayed feeds report the prefix as NSE_DLY); syminfo.tickerid can carry modifiers that break JSON
+jsSym = str.replace_all(str.replace(syminfo.prefix, "_DLY", "") + ":" + syminfo.ticker, '"', "")
+
+if newDay
+    tradesToday := 0
+    lossesToday := 0
+    rToday := 0.0
+
+if barstate.isconfirmed
+    int   wasPos = pos
+    float sPrev  = sP
+    string closedId = tradeId
+    // --- manage open position (SL checked first = conservative) ---
+    if pos == 1
+        if low <= sP
+            evs.push(t1Hit ? "Long exit: trail/BE stop" : "Long exit: SL hit")
+            trPnl += rem * (math.min(open, sP) - eP)
+            pos := 0
+        else
+            bool hitNow = false
+            if not t1Hit and high >= t1P
+                t1Hit := true
+                trPnl += 0.4 * (t1P - eP)
+                rem -= 0.4
+                sP := eP
+                hitNow := true
+                evs.push("Long T1 hit: book part, SL->BE")
+            if not t2Hit and high >= t2P
+                t2Hit := true
+                trPnl += 0.3 * (t2P - eP)
+                rem -= 0.3
+                sP := t1P
+                hitNow := true
+                evs.push("Long T2 hit: book part, SL->T1")
+            if high >= t3P
+                trPnl += rem * (t3P - eP)
+                evs.push("Long T3 hit: exit all")
+                pos := 0
+            else if hitNow and intrabarStop and close <= sP
+                // FIX v2 (H07): the close is below the moved stop, so it was crossed after the target in this bar
+                trPnl += rem * (sP - eP)
+                evs.push("Long exit: moved stop crossed in the same bar")
+                pos := 0
+    else if pos == -1
+        if high >= sP
+            evs.push(t1Hit ? "Short exit: trail/BE stop" : "Short exit: SL hit")
+            trPnl += rem * (eP - math.max(open, sP))
+            pos := 0
+        else
+            bool hitNow = false
+            if not t1Hit and low <= t1P
+                t1Hit := true
+                trPnl += 0.4 * (eP - t1P)
+                rem -= 0.4
+                sP := eP
+                hitNow := true
+                evs.push("Short T1 hit: book part, SL->BE")
+            if not t2Hit and low <= t2P
+                t2Hit := true
+                trPnl += 0.3 * (eP - t2P)
+                rem -= 0.3
+                sP := t1P
+                hitNow := true
+                evs.push("Short T2 hit: book part, SL->T1")
+            if low <= t3P
+                trPnl += rem * (eP - t3P)
+                evs.push("Short T3 hit: exit all")
+                pos := 0
+            else if hitNow and intrabarStop and close >= sP
+                trPnl += rem * (eP - sP)
+                evs.push("Short exit: moved stop crossed in the same bar")
+                pos := 0
+    // FIX: square off on the bar that CLOSES at/after sqOff (report used bar open time,
+    // which on 15m charts exited at the 15:30 close instead of 15:15).
+    if pos != 0 and (minsClose >= f_hm(sqOff) or newDay)
+        evs.push("Square-off " + str.tostring(sqOff))
+        trPnl += rem * pos * (close - eP)
+        pos := 0
+    bool exitedNow = wasPos != 0 and pos == 0
+    if exitedNow
+        float rTrade = R0 > 0 ? trPnl / R0 : 0.0
+        lossesToday += rTrade < 0 ? 1 : 0
+        rToday += rTrade
+
+    // --- drawings (FIX): lines are never moved back in time. They extend while the trade is
+    // open and freeze at exit; an SL move ends the old SL segment and starts a new one here,
+    // so every past bar keeps showing the stop that was live on it.
+    if wasPos != 0
+        int x2 = pos != 0 ? bar_index + 1 : bar_index
+        lnE.set_x2(x2)
+        lnS.set_x2(pos != 0 and sP != sPrev ? bar_index : x2)
+        ln1.set_x2(x2)
+        ln2.set_x2(x2)
+        ln3.set_x2(x2)
+        if pos != 0 and sP != sPrev
+            lnS := line.new(bar_index, sP, bar_index + 1, sP, color = color.red, style = line.style_dotted, width = 2)
+
+    // --- new signals only when flat ---
+    dayOK  = (dailyMaxLoss == 0 or lossesToday < dailyMaxLoss) and (dailyMaxR == 0 or rToday > -dailyMaxR)
+    baseOK = pos == 0 and (allowReentry or not exitedNow) and dayOK and timeOK and chopOK and bodyOK and volOK and tradesToday < maxTrades and bar_index - lastSig >= cooldown
+    longSig  := baseOK and close > brkHi and close > open and riskL <= maxRiskAtr * atrv and roomL and sL >= minScore and sL > sS
+    shortSig := baseOK and close < brkLo and close < open and riskS <= maxRiskAtr * atrv and roomS and sS >= minScore and sS > sL
+    if longSig or shortSig
+        pos := longSig ? 1 : -1
+        eP := close
+        sP := longSig ? slL : slS
+        float R = math.abs(eP - sP)
+        t1P := eP + pos * r1m * R
+        t2P := eP + pos * r2m * R
+        t3P := eP + pos * r3m * R
+        t1Hit := false
+        t2Hit := false
+        R0 := R
+        rem := 1.0
+        trPnl := 0.0
+        tradeId := syminfo.ticker + "-" + timeframe.period + "-" + str.tostring(time_close) + "-" + (longSig ? "L" : "S")
+        tradesToday += 1
+        lastSig := bar_index
+        float sc = longSig ? sL : sS
+        string grade = sc >= aPlusScore ? "A+" : "A"
+        // FIX: previous trades' lines are kept (the report deleted them, erasing history)
+        lnE := line.new(bar_index, eP, bar_index + 1, eP, color = color.blue, width = 2)
+        lnS := line.new(bar_index, sP, bar_index + 1, sP, color = color.red, width = 2)
+        ln1 := line.new(bar_index, t1P, bar_index + 1, t1P, color = color.green, style = line.style_dashed)
+        ln2 := line.new(bar_index, t2P, bar_index + 1, t2P, color = color.green, style = line.style_dashed)
+        ln3 := line.new(bar_index, t3P, bar_index + 1, t3P, color = color.green, width = 2)
+        string txt = (longSig ? "BUY " : "SELL ") + grade + " | Score " + str.tostring(sc, "#") +
+             "\nEntry " + f_num(eP) + "\nSL " + f_num(sP) + " (R " + f_num(R) + ")" +
+             "\nT1 " + f_num(t1P) + "  T2 " + f_num(t2P) + "  T3 " + f_num(t3P) +
+             "\nOpt≈ +" + str.tostring(optDelta * r1m * R, "#.#") + "/+" + str.tostring(optDelta * r2m * R, "#.#") + "/+" + str.tostring(optDelta * r3m * R, "#.#") + " pts (Δ" + str.tostring(optDelta) + ")" +
+             "\nOI: " + oiState + (isExpiry ? " | EXPIRY" : "")
+        label.new(bar_index, longSig ? low - atrv : high + atrv, txt, style = longSig ? label.style_label_up : label.style_label_down,
+             color = longSig ? color.new(color.green, 10) : color.new(color.red, 10), textcolor = color.white, size = size.small)
+        // FIX: built by concatenation. The report's str.format() pattern used "{{" (not a valid
+        // escape in Pine's MessageFormat) and would print numbers with thousands separators
+        // (e.g. 24,512.5), which is invalid JSON.
+        // FIX v2: schema version, trade id (idempotency key for the bridge) and the signal bar's close time "t".
+        string js = '{"v":2,"kind":"signal","id":"' + tradeId + '","t":' + str.tostring(time_close) + ',"symbol":"' + jsSym +
+             '","tf":"' + timeframe.period + '","side":"' + (longSig ? "BUY" : "SELL") +
+             '","entry":' + f_num(eP) + ',"sl":' + f_num(sP) + ',"t1":' + f_num(t1P) + ',"t2":' + f_num(t2P) + ',"t3":' + f_num(t3P) +
+             ',"score":' + str.tostring(math.round(sc)) + ',"grade":"' + grade + '","oi":"' + oiState + '"'
+        // FIX v2 (F-06/L02): one bar's events and a same-bar new signal go out in ONE alert (TradingView allows one
+        // alert() per bar close), and the closed trade's events are reported under its own id.
+        if evs.size() > 0
+            js += ',"closed":{"id":"' + closedId + '","events":["' + array.join(evs, '","') + '"]}'
+        alert(js + '}', alert.freq_once_per_bar_close)
+    if evs.size() > 0
+        label.new(bar_index, close, array.join(evs, "\n"), style = label.style_label_left, color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny)
+        if not (longSig or shortSig)
+            // the stop is reported only while a position is still open (review F-06: no "SL" for a closed trade)
+            string ej = '{"v":2,"kind":"event","id":"' + (pos != 0 ? tradeId : closedId) + "-" + str.tostring(time_close) +
+                 '","trade":"' + (pos != 0 ? tradeId : closedId) + '","t":' + str.tostring(time_close) + ',"symbol":"' + jsSym +
+                 '","tf":"' + timeframe.period + '","pos":' + str.tostring(pos) + ',"events":["' + array.join(evs, '","') + '"]' +
+                 (pos != 0 ? ',"sl":' + f_num(sP) : '') + '}'
+            alert(ej, alert.freq_once_per_bar_close)
+
+alertcondition(longSig, "NFCE Long", "NFCE BUY signal on {{ticker}} at {{close}}")
+alertcondition(shortSig, "NFCE Short", "NFCE SELL signal on {{ticker}} at {{close}}")
+
+// ───────────────────────── 11. PLOTS ─────────────────────────
+plot(vw, "VWAP", color.orange, 2)
+plot(showVW ? vwU2 : na, "VWAP +2σ", color.new(color.orange, 60))
+plot(showVW ? vwL2 : na, "VWAP -2σ", color.new(color.orange, 60))
+plot(e21, "EMA21", color.new(color.aqua, 40))
+plot(showLv ? pdh : na, "PDH", color.new(color.lime, 30), style = plot.style_linebr)
+plot(showLv ? pdl : na, "PDL", color.new(color.red, 30), style = plot.style_linebr)
+plot(showLv ? tc : na, "CPR TC", color.new(color.purple, 50), style = plot.style_linebr)
+plot(showLv ? bc : na, "CPR BC", color.new(color.purple, 50), style = plot.style_linebr)
+plot(showLv and orDone ? orH : na, "OR High", color.new(color.teal, 30), style = plot.style_linebr)
+plot(showLv and orDone ? orL : na, "OR Low", color.new(color.teal, 30), style = plot.style_linebr)
+bgcolor(isExpiry ? color.new(color.yellow, 94) : na, title = "Expiry day")
+
+// ───────────────────────── 12. DASHBOARD ─────────────────────────
+// Dashboard shows the live (unconfirmed) bar; signals only ever use confirmed bars.
+var table tb = table.new(position.top_right, 2, 17, bgcolor = color.new(color.black, 15), border_width = 1)
+f_row(r, k, v, c) =>
+    table.cell(tb, 0, r, k, text_color = color.silver, text_size = size.small)
+    table.cell(tb, 1, r, v, text_color = c, text_size = size.small)
+if showTbl and barstate.islast
+    f_row(0, "Preset / TF", instr + " · " + p + " / " + timeframe.period + (tfMin == 0 or tfMin > 15 ? " (use 1-15m!)" : "") +
+         (cV == 0 ? " | NO VOLUME: set the futures symbol" : ""), cV == 0 ? color.orange : color.white)
+    f_row(1, "Score L / S", str.tostring(sL, "#") + " / " + str.tostring(sS, "#") + "  (min " + str.tostring(minScore) + ")", sL >= minScore ? color.lime : sS >= minScore ? color.red : color.white)
+    f_row(2, "RVOL (time-of-day)", str.tostring(rvol, "#.##") + " (thr " + str.tostring(rvolThr) + ")", nz(rvol) >= rvolThr ? color.lime : color.white)
+    f_row(3, "Volume z", str.tostring(volZ, "#.##"), nz(volZ) >= zThr ? color.lime : color.white)
+    f_row(4, "CVD 3-bar", cvdSlope > 0 ? "Rising" : "Falling", cvdSlope > 0 ? color.lime : color.red)
+    f_row(5, "EMA / VWAP", (e9 > e21 and e21 > e50 ? "Bull stack" : e9 < e21 and e21 < e50 ? "Bear stack" : "Mixed") + (close > vw ? " | >VWAP" : " | <VWAP"), close > vw ? color.lime : color.red)
+    f_row(6, "ADX / DI", str.tostring(adx, "#.#") + (diP > diM ? " +DI" : " -DI"), adx >= adxMin ? color.yellow : color.gray)
+    f_row(7, "Supertrend", stDir < 0 ? "Up" : "Down", stDir < 0 ? color.lime : color.red)
+    f_row(8, "HTF " + htfTF, htfBull ? "Bull" : "Bear", htfBull ? color.lime : color.red)
+    f_row(9, "Chop / Squeeze", str.tostring(chop, "#.#") + (sqzOn ? " | SQZ" : ""), chopOK ? color.white : color.orange)
+    f_row(10, "Futures OI", oiState + (oiOK ? " (" + str.tostring(dOI, format.volume) + ")" : ""), oiState == "Long build-up" or oiState == "Short covering" ? color.lime : oiState == "n/a" ? color.gray : color.red)
+    f_row(11, "India VIX", str.tostring(vixNow, "#.##") + " Δ5 " + str.tostring(vixChg, "#.##"), nz(vixNow) > vixHi ? color.orange : color.white)
+    f_row(12, "VIX 1σ day move", str.tostring(expMove, "#.#") + " pts", color.white)
+    f_row(13, "Heavyweights", str.tostring(hwUp) + " up / " + str.tostring(hwDn) + " dn", hwUp > hwDn ? color.lime : color.red)
+    f_row(14, "Session", (timeOK ? "Tradeable" : "Filtered") + (isExpiry ? " | EXPIRY" : ""), timeOK ? color.lime : color.orange)
+    f_row(15, "Position", pos == 1 ? "LONG  SL " + f_num(sP) : pos == -1 ? "SHORT SL " + f_num(sP) : "Flat", color.white)
+    f_row(16, "Trades today", str.tostring(tradesToday) + " / " + str.tostring(maxTrades), color.white)

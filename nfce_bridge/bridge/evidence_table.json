@@ -1,0 +1,326 @@
+{
+ "built_utc": "2026-10-20T06:57:24Z",
+ "source": "base NFCE rules on 28 hold-out sessions (14 Aug - 14 Oct 2026), 50 Nifty stocks + NIFTY/BANKNIFTY spot, 5m+15m, dated costs + 4 ticks per side; plus TradingView v2 futures runs; rebuilt 20 Oct 2026 after review round 3 (stock sizing at the first price, unresolved trades excluded)",
+ "sessions": [
+  "2026-08-18",
+  "2026-08-19",
+  "2026-08-20",
+  "2026-08-21",
+  "2026-08-24",
+  "2026-08-27",
+  "2026-08-28",
+  "2026-08-31",
+  "2026-09-01",
+  "2026-09-03",
+  "2026-09-04",
+  "2026-09-07",
+  "2026-09-10",
+  "2026-09-15",
+  "2026-09-18",
+  "2026-09-21",
+  "2026-09-22",
+  "2026-09-23",
+  "2026-09-24",
+  "2026-09-25",
+  "2026-09-29",
+  "2026-09-30",
+  "2026-10-01",
+  "2026-10-06",
+  "2026-10-09",
+  "2026-10-12",
+  "2026-10-13",
+  "2026-10-14"
+ ],
+ "min_n": 30,
+ "cells": {
+  "later|high|index": {
+   "n": 12,
+   "win": 0.167,
+   "gross_r": -0.135,
+   "net_r": -0.717,
+   "ci": [
+    -1.25,
+    -0.308
+   ],
+   "days": 7,
+   "thin": true
+  },
+  "later|high|stock": {
+   "n": 219,
+   "win": 0.384,
+   "gross_r": 0.234,
+   "net_r": -0.411,
+   "ci": [
+    -0.603,
+    -0.224
+   ],
+   "days": 28,
+   "thin": false
+  },
+  "later|low|index": {
+   "n": 1,
+   "win": 0.0,
+   "gross_r": -1.0,
+   "net_r": -1.1,
+   "ci": null,
+   "days": 1,
+   "thin": true
+  },
+  "later|low|stock": {
+   "n": 37,
+   "win": 0.541,
+   "gross_r": 0.061,
+   "net_r": -0.064,
+   "ci": [
+    -0.346,
+    0.284
+   ],
+   "days": 14,
+   "thin": false
+  },
+  "later|mid|index": {
+   "n": 4,
+   "win": 0.75,
+   "gross_r": 0.327,
+   "net_r": 0.077,
+   "ci": [
+    -0.087,
+    0.322
+   ],
+   "days": 3,
+   "thin": true
+  },
+  "later|mid|stock": {
+   "n": 107,
+   "win": 0.43,
+   "gross_r": -0.028,
+   "net_r": -0.253,
+   "ci": [
+    -0.414,
+    -0.097
+   ],
+   "days": 26,
+   "thin": false
+  },
+  "morning|high|index": {
+   "n": 5,
+   "win": 0.6,
+   "gross_r": 0.509,
+   "net_r": 0.071,
+   "ci": [
+    -0.86,
+    0.614
+   ],
+   "days": 4,
+   "thin": true
+  },
+  "morning|high|stock": {
+   "n": 50,
+   "win": 0.58,
+   "gross_r": 0.463,
+   "net_r": -0.049,
+   "ci": [
+    -0.373,
+    0.259
+   ],
+   "days": 19,
+   "thin": false
+  },
+  "morning|low|stock": {
+   "n": 15,
+   "win": 0.6,
+   "gross_r": 0.143,
+   "net_r": 0.01,
+   "ci": [
+    -0.487,
+    0.539
+   ],
+   "days": 12,
+   "thin": true
+  },
+  "morning|mid|index": {
+   "n": 2,
+   "win": 0.5,
+   "gross_r": -0.3,
+   "net_r": -0.49,
+   "ci": [
+    -1.195,
+    0.215
+   ],
+   "days": 2,
+   "thin": true
+  },
+  "morning|mid|stock": {
+   "n": 52,
+   "win": 0.462,
+   "gross_r": -0.019,
+   "net_r": -0.241,
+   "ci": [
+    -0.547,
+    0.029
+   ],
+   "days": 24,
+   "thin": false
+  },
+  "later|high|all": {
+   "n": 231,
+   "win": 0.372,
+   "gross_r": 0.215,
+   "net_r": -0.427,
+   "ci": [
+    -0.626,
+    -0.244
+   ],
+   "days": 28,
+   "thin": false
+  },
+  "later|low|all": {
+   "n": 38,
+   "win": 0.526,
+   "gross_r": 0.033,
+   "net_r": -0.091,
+   "ci": [
+    -0.385,
+    0.267
+   ],
+   "days": 14,
+   "thin": false
+  },
+  "later|mid|all": {
+   "n": 111,
+   "win": 0.441,
+   "gross_r": -0.015,
+   "net_r": -0.241,
+   "ci": [
+    -0.397,
+    -0.085
+   ],
+   "days": 26,
+   "thin": false
+  },
+  "morning|high|all": {
+   "n": 55,
+   "win": 0.582,
+   "gross_r": 0.467,
+   "net_r": -0.038,
+   "ci": [
+    -0.354,
+    0.253
+   ],
+   "days": 19,
+   "thin": false
+  },
+  "morning|low|all": {
+   "n": 15,
+   "win": 0.6,
+   "gross_r": 0.143,
+   "net_r": 0.01,
+   "ci": [
+    -0.487,
+    0.539
+   ],
+   "days": 12,
+   "thin": true
+  },
+  "morning|mid|all": {
+   "n": 54,
+   "win": 0.463,
+   "gross_r": -0.029,
+   "net_r": -0.25,
+   "ci": [
+    -0.559,
+    0.032
+   ],
+   "days": 24,
+   "thin": false
+  },
+  "later|all|all": {
+   "n": 380,
+   "win": 0.408,
+   "gross_r": 0.13,
+   "net_r": -0.339,
+   "ci": [
+    -0.487,
+    -0.208
+   ],
+   "days": 28,
+   "thin": false
+  },
+  "morning|all|all": {
+   "n": 124,
+   "win": 0.532,
+   "gross_r": 0.212,
+   "net_r": -0.125,
+   "ci": [
+    -0.36,
+    0.073
+   ],
+   "days": 26,
+   "thin": false
+  },
+  "all|all|all": {
+   "n": 504,
+   "win": 0.438,
+   "gross_r": 0.15,
+   "net_r": -0.286,
+   "ci": [
+    -0.412,
+    -0.179
+   ],
+   "days": 28,
+   "thin": false
+  }
+ },
+ "tradingview_futures": {
+  "n": 94,
+  "win": 0.468,
+  "gross_r": 0.084,
+  "net_r": -0.173,
+  "ci": [
+   -0.39,
+   0.043
+  ],
+  "days": 73,
+  "thin": false
+ },
+ "validated_classes": [],
+ "index_cells": {
+  "tv|all": {
+   "n": 94,
+   "win": 0.447,
+   "gross_r": 0.084,
+   "net_r": -0.203,
+   "ci": [
+    -0.419,
+    0.015
+   ],
+   "days": 73,
+   "thin": false
+  },
+  "tv|later": {
+   "n": 56,
+   "win": 0.446,
+   "gross_r": 0.127,
+   "net_r": -0.171,
+   "ci": [
+    -0.449,
+    0.113
+   ],
+   "days": 48,
+   "thin": false
+  },
+  "tv|morning": {
+   "n": 38,
+   "win": 0.447,
+   "gross_r": 0.022,
+   "net_r": -0.249,
+   "ci": [
+    -0.535,
+    0.047
+   ],
+   "days": 31,
+   "thin": false
+  }
+ },
+ "index_source": "TradingView v2 runs on NIFTY1!/BANKNIFTY1! futures (Dec 2025 - Oct 2026), current costs; the hold-out simulation's index trades are too few (24) to stand alone"
+}

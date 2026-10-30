@@ -1,0 +1,14 @@
+#!/bin/bash
+# NFCE control panel: `nfce` (menu) or `nfce help`. Installed as ~/.local/bin/nfce by `nfce setup`.
+# Uses the project's Python when it exists, else the system python3 (enough for `nfce setup` on a new Mac).
+SELF="$0"
+while [ -L "$SELF" ]; do                     # follow the ~/.local/bin symlink back to this folder
+  T="$(readlink "$SELF")"
+  case "$T" in /*) SELF="$T" ;; *) SELF="$(dirname "$SELF")/$T" ;; esac
+done
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+cd "$DIR" || exit 1
+if [ -x .venv/bin/python ]; then
+  exec .venv/bin/python -m bridge.panel "$@"
+fi
+exec python3 -m bridge.panel "$@"

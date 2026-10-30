@@ -1,0 +1,747 @@
+"""The Telegram bot's own brain, so it runs without an assistant attached (owner, 21 Oct evening).
+
+Roles
+* ADMIN (TELEGRAM_ADMIN_CHAT_IDS; default: the main chat and the extra chats): every command, including control of the
+  paper account, the features, the users and the system (pause, close, risk settings, restart, phone login).
+* USER (the main chat, and chats the admin adds with /adduser): signals and reports, read-only commands, plain-English
+  questions, /stop and /start for their own messages, and /ask to reach the admin.
+* Unknown private chats: nothing runs; the admins get an access request with the chat id (/adduser <id> to allow).
+
+Plain English: "profit?", "open positions", "any signals today", "gainers", "is it working" are understood (keyword
+rules, no outside service). Anything else is saved as a note; a user's note is forwarded to the admins.
+
+Jobs that run on their own: access requests, Upstox token watch (with /login from the phone), a 09:05 morning brief,
+a health watchdog (alert after 3 minutes, all-clear on recovery), an error-burst alert, and at 15:35 the ledger to the
+admins and a database backup.
+"""
+from __future__ import annotations
+
+import logging
+import re
+import secrets
+import shutil
+import sqlite3
+import time
+from collections import deque
+from datetime import datetime, timedelta, timezone
+
+from .providers import IST, ProviderError
+
+log = logging.getLogger("nfce.bot")
+
+USER_HELP = (
+    "🤖 NFCE bot · paper signals, never places orders\n"
+    "\n"
+    "Ask in plain words: \"profit?\", \"open positions\", \"signals today\", \"gainers\", \"is it working?\"\n"
+    "\n"
+    "/today: today's signals and the paper account's result\n"
+    "/open: the account's open positions, live\n"
+    "/account (or /pnl): equity, cash, today's result\n"
+    "/ledger: every account fill as a CSV file\n"
+    "/watch: the latest F&O watchlist · /scan: a fresh one now\n"
+    "/status [NIFTY|SENSEX]: option chain and futures summary\n"
+    "/range: next-hour range forecasts and their live score\n"
+    "/health: is everything running\n"
+    "/risk: open positions by direction, and the loss if every stop is hit\n"
+    "/explain: how to read a signal · /about: what is and is not proven\n"
+    "/meme: a little trading humour (the signals stay strictly professional)\n"
+    "/ask <message>: send a message to the admin\n"
+    "/stop, /start: pause or resume the bot's messages to you\n"
+    "/myid: your chat id"
+)
+ADMIN_HELP = (
+    "🛠 Admin commands\n"
+    "/pause, /resume: stop or allow all new paper entries (books and accounts)\n"
+    "/close <n|all>: sell account positions now at the bid (asks to confirm)\n"
+    "/set <risk|losslimit|maxopen|costgate|deploy|stockrisk> <value>: account settings (saved)\n"
+    "/toggle <index|stocks|scanner|gs> <on|off>: switch a feature without a restart\n"
+    "/gs: the GS research engine (paper, own book, not yet evidence)\n"
+    "/reset [capital]: restart the paper account's cash (asks to confirm)\n"
+    "/report: the full end-of-day report now · /export: ledger + signals as CSV\n"
+    "/users · /adduser <id> · /removeuser <id> · /mute <id> · /unmute <id>\n"
+    "/broadcast <text>: message every user\n"
+    "/notes [n]: saved notes and requests · /errors: recent errors\n"
+    "/config: current settings · /login, /code <address>: Upstox sign-in from your phone\n"
+    "/backup: copy the database now · /restart: restart the bridge (asks to confirm)\n"
+    "@admin: <text>: saved for review (and run, if it reads as a command)"
+)
+EXPLAIN = (
+    "📖 How to read a signal\n"
+    "🟩 BUY / 🟥 SELL, the index or stock, the candle size (3/5/15-min) and the time.\n"
+    "Futures: entry, stop loss (SL) and three targets T1 → T2 → T3.\n"
+    "Option: the in-the-money call (BUY) or put (SELL) to buy instead, with its own estimated SL and targets. "
+    "Exit when the futures levels say so; the option levels are estimates.\n"
+    "Track record: 🟢 proven in a registered test · 🟠 promising, not proven · 🔴 no proven edge.\n"
+    "💼 Account lines: what the ₹5 L paper account did with the signal (bought, or skipped and why).\n"
+    "👀 Watchlist: stocks moving a lot today. They are to WATCH, not to buy: a gainer does not always keep gaining."
+)
+ABOUT = (
+    "🧭 What is proven, plainly\n"
+    "• Nothing here is proven to make money after costs.\n"
+    "• NIFTY futures signals: −0.20R per trade after costs over 94 tested trades. Options are being measured live.\n"
+    "• 3-min stock signals: −0.27R per trade as futures (16,598 tested trades, 210 stocks); 4× wider stops −0.03R; "
+    "morning-only, with-the-index and an AI trade-picker all failed too; on 15-min bars −0.18R (4,056). "
+    "Shown for information; the account takes their options at ¼ size.\n"
+    "• Gainers/losers/volume lists: no edge when tested (7,135 trades). Watch, don't chase.\n"
+    "• Next-hour RANGE forecasts do have measured skill (size of the move, not its direction).\n"
+    "• Everything is paper trading. Not investment advice; no orders are placed."
+)
+
+# plain-English questions -> commands (first match wins; admin rules are checked first, for admins only)
+ADMIN_INTENTS = [
+    (r"\b(close|exit|sell) (all|everything)\b|\bsquare ?off\b", "/close all"),
+    (r"\b(pause|halt|stop) (trading|entries|the account|everything)\b|^\s*(pause|halt)\b", "/pause"),
+    (r"\b(resume|unpause|start trading|restart trading)\b", "/resume"),
+    (r"\b(full report|end of day report|eod report|send (the )?report)\b", "/report"),
+    (r"\b(log ?in|sign ?in|new token|token)\b", "/login"),
+    (r"\b(errors?|what went wrong)\b", "/errors"),
+]
+INTENTS = [
+    (r"\b(open positions?|holdings?|what('s| is) open|positions?)\b", "/open"),
+    (r"\b(p ?& ?l|pnl|profit|loss|equity|account|balance|how much)\b", "/account"),
+    (r"\b(gainers?|losers?|movers?|top ?5|top five|volume|watch ?list)\b", "/watch"),
+    (r"\b(signals?|calls?|trades?|entries|today)\b", "/today"),
+    (r"\b(health|working|alive|running|up\?|status)\b", "/health"),
+    (r"\b(range|how far|move size)\b", "/range"),
+    (r"\b(explain|how (do i|to) read|meaning)\b", "/explain"),
+    (r"\b(proven|accura\w*|win ?rate|trust|edge|guarantee\w*)\b", "/about"),
+    (r"\b(help|commands|what can you do)\b", "/help"),
+]
+LOW_BATTERY_PCT = 25
+
+
+def power_status() -> tuple[bool | None, int | None]:
+    """(on the charger?, battery %) from macOS pmset; (None, None) when it cannot be read."""
+    import subprocess
+    try:
+        out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5).stdout
+        pct = re.search(r"(\d+)%", out)
+        return "AC Power" in out, int(pct.group(1)) if pct else None
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+
+
+RELAY_WORDS = 6            # with the assistant relay on, an admin message longer than this goes to the assistant
+CONFIRM_TTL_S = 90
+ALERT_AFTER_S = 180
+
+
+class Bot:
+    def __init__(self, bridge):
+        self.b = bridge
+        self.store = bridge.store
+        self.errors: deque = deque(maxlen=40)          # (time, text)
+        self._confirm: dict[str, tuple[str, str, float]] = {}
+        self._login_state: str | None = None
+        self._problems: dict[str, tuple[float, bool]] = {}   # problem -> (first seen, alerted)
+        self._requests_told: set[tuple[str, str]] = set()
+        self.restart_requested = False
+        self.started = time.time()
+        tg = bridge.tg
+        if hasattr(tg, "users"):
+            tg.users = self.users
+            tg.muted = self.muted
+
+    # ---------- roles and people ----------
+    @property
+    def chat(self) -> str | None:
+        return getattr(self.b.tg, "reply_to", None)
+
+    def is_admin(self, chat: str | None = None) -> bool:
+        f = getattr(self.b.tg, "is_admin", None)
+        return True if f is None else f(chat if chat is not None else self.chat)
+
+    def _set(self, key: str) -> set[str]:
+        return {str(x) for x in (self.store.kv_get(key) or [])}
+
+    def _put(self, key: str, val: set[str]) -> None:
+        self.store.kv_set(key, sorted(val))
+
+    def users(self) -> set[str]:
+        return self._set("tg_users")
+
+    def muted(self) -> set[str]:
+        return self._set("tg_muted")
+
+    def admin(self, text: str, html: bool = False) -> None:
+        f = getattr(self.b.tg, "send_admin", None)
+        (f or self.b.tg.send)(text, html=html)
+
+    def off(self, feature: str) -> bool:
+        return bool(self.store.kv_get(f"feature_off_{feature}"))
+
+    def reply(self, text: str, html: bool = False) -> str:
+        self.b.tg.send(text, html=html)
+        return text
+
+    # ---------- plain English ----------
+    QUESTION = re.compile(r"\?\s*$|^\s*(what|whats|what's|how|any|show|is|are|did|do|does|give|send|tell|list|where|"
+                          r"which|can|could|please|pls|check|status)\b", re.I)
+
+    def intent(self, text: str) -> str | None:
+        """A command for a QUESTION or a short request; a longer statement (a requirement, an idea) stays a note."""
+        t = text.lower().strip()
+        if not (self.QUESTION.search(t) or len(t.split()) <= 3):
+            return None
+        rules = (ADMIN_INTENTS if self.is_admin() else []) + INTENTS
+        for pat, cmd in rules:
+            if re.search(pat, t):
+                return cmd
+        return None
+
+    def free_text(self, text: str, tagged_admin: bool) -> str:
+        """A message that is not a /command. Always saved; answered when it reads as a question we know."""
+        admin = self.is_admin()
+        if tagged_admin and admin:
+            self.store.add_event("telegram-admin", {"text": text[:2000], "chat": self.chat or "main"})
+        else:
+            self.store.add_event("telegram-note", {"text": text[:2000], "chat": self.chat or "main"})
+        if not admin:
+            self.admin(f"💬 Message from user {self.chat}:\n{text[:1500]}")
+        relay = admin and getattr(self.b.s, "assistant_relay", False)
+        long_ = len(text.split()) > RELAY_WORDS          # live 22 Oct: long admin questions were misread as /today
+        cmd = None if relay and long_ else self.intent(text)
+        if cmd:
+            self.reply(f"🤖 Reading that as {cmd}")
+            return self.b.handle_command(cmd)
+        if relay and (tagged_admin or long_):
+            return self.reply("📨 Saved and passed to your assistant. The reply will come here.")
+        if not admin:
+            return self.reply("📝 Noted, saved and passed to the admin.\nI also understand questions like "
+                              "\"profit?\", \"open positions\", \"signals today\", \"gainers\". /help lists everything.")
+        return self.reply("📝 Noted and saved (no command recognised). /admin lists the admin commands.")
+
+    # ---------- commands ----------
+    ADMIN_ONLY = {"/pause", "/halt", "/resume", "/close", "/set", "/toggle", "/reset", "/report", "/export", "/users",
+                  "/adduser", "/removeuser", "/mute", "/unmute", "/broadcast", "/notes", "/errors", "/config", "/login",
+                  "/code", "/backup", "/restart", "/confirm", "/admin", "/gs"}
+
+    def handle(self, cmd: str, args: list[str], raw: str) -> str | None:
+        """Returns the reply, or None when the command is not the bot's (the bridge handles it)."""
+        if cmd in self.ADMIN_ONLY and not self.is_admin():
+            return self.reply("🔒 That command is for the admin. /help lists yours.")
+        f = getattr(self, "cmd_" + cmd[1:], None) if cmd.startswith("/") else None
+        if f is None:
+            return None
+        try:
+            return f(args, raw)
+        except ProviderError as exc:
+            return self.reply(f"⚠️ Market data error: {exc}"[:500])
+
+    def cmd_risk(self, args, raw):
+        """The portfolio view (22 Oct: four SELLs were one market bet)."""
+        out = []
+        for a in getattr(self.b, "accounts", []):
+            if a.positions:
+                x = a.exposure()
+                out.append(f"• {a.name}: {x['sell']} SELL / {x['buy']} BUY · if every stop is hit −₹{x['at_risk']:,.0f} "
+                           f"({x['at_risk'] / max(a.equity(a._last_qs), 1) * 100:.1f}% of equity)")
+        return self.reply("\n".join(["⚖️ Open risk"] + out) if out else "⚖️ No open positions in the paper accounts.")
+
+    def cmd_meme(self, args, raw):
+        import random
+        from .offline_bot import MEMES
+        return self.reply(random.choice(MEMES))
+
+    def cmd_help(self, args, raw):
+        return self.reply(USER_HELP + ("\n\n" + ADMIN_HELP if self.is_admin() else ""))
+
+    def cmd_admin(self, args, raw):
+        return self.reply(ADMIN_HELP)
+
+    def cmd_start(self, args, raw):
+        if self.chat:
+            self._put("tg_muted", self.muted() - {self.chat})
+        return self.reply("👋 Welcome. You will get the signals and reports here.\n\n" + USER_HELP)
+
+    def cmd_stop(self, args, raw):
+        if self.is_admin():
+            return self.reply("Admins always get the messages. /pause stops new paper entries instead.")
+        out = self.reply("🔕 OK, no more messages from me. Send /start to resume.")   # before the mute silences it
+        self._put("tg_muted", self.muted() | {self.chat})
+        return out
+
+    def cmd_myid(self, args, raw):
+        return self.reply(f"Your chat id: {self.chat or 'local'} ({'admin' if self.is_admin() else 'user'})")
+
+    def cmd_explain(self, args, raw):
+        return self.reply(EXPLAIN)
+
+    def cmd_about(self, args, raw):
+        return self.reply(ABOUT)
+
+    def cmd_gs(self, args, raw):
+        """Admin, read-only: the GS research engine's books and health (bridge/gs_live.py)."""
+        gs = getattr(self.b, "gs", None)
+        if gs is None:
+            return self.reply("The GS engine is off (GS=on and STOCK_ENGINE=on in .env, then a restart).")
+        return self.reply(gs.report())
+
+    def cmd_pnl(self, args, raw):
+        return self.b.handle_command("/account")
+
+    def cmd_ask(self, args, raw):
+        text = raw.split(None, 1)[1] if len(raw.split(None, 1)) > 1 else ""
+        if not text:
+            return self.reply("Usage: /ask <your message for the admin>")
+        self.store.add_event("telegram-note", {"text": text[:2000], "chat": self.chat or "main", "ask": True})
+        self.admin(f"❓ From {'admin' if self.is_admin() else 'user'} {self.chat}:\n{text[:1500]}")
+        return self.reply("📨 Sent to the admin.")
+
+    def cmd_watch(self, args, raw):
+        sc = self.b.scanner
+        if not sc:
+            return self.reply("The F&O watchlist is off.")
+        text = getattr(sc, "last_text", "")
+        if not text:
+            return self.reply("No watchlist yet today (they come at " + ", ".join(self.b.s.scanner_times)
+                              + "). /scan makes one now.")
+        return self.reply(text, html=True)
+
+    def cmd_open(self, args, raw):
+        accts = self.b.accounts
+        if not accts:
+            return self.reply("The paper account is off.")
+        lines = []
+        for a in accts:
+            ps = list(a.positions.values())
+            if not ps:
+                lines.append(f"💼 {a.name}: no open positions")
+                continue
+            try:
+                qs = self.b.provider.quotes(sorted({p.key for p in ps} | {p.under_key for p in ps}))
+            except ProviderError:
+                qs = {}
+            lines.append(f"💼 {a.name}: {len(ps)} open")
+            for i, p in enumerate(ps, 1):
+                o, u = qs.get(p.key), qs.get(p.under_key)
+                bid = o.bid if o is not None and o.bid else None
+                pnl = (bid - p.entry) * p.rem_lots * p.lot_units if bid else None
+                lines.append(f"{i}. {p.symbol} · {p.rem_lots}/{p.lots} lots · in {p.entry:,.2f}"
+                             + (f" · bid {bid:,.2f} · {'+' if pnl >= 0 else '−'}₹{abs(pnl):,.0f}" if bid else " · no bid")
+                             + ("\n    manual position: no automatic stop or target (sold by the owner or at 15:15)"
+                                if abs(p.stop) >= 1e11 else
+                                f"\n    stop {p.stop:,.2f} on {'spot' if '|' in p.under_key else p.under_key}")
+                             + (f" (now {u.last_price:,.2f})" if u is not None else "")
+                             + (f" · targets hit {p.hits}" if p.hits else ""))
+        return self.reply("\n".join(lines))
+
+    def cmd_today(self, args, raw):
+        now = self.b.now()
+        day = now.date().isoformat()
+        start_utc = datetime.combine(now.date(), datetime.min.time(), IST).astimezone(timezone.utc).isoformat()
+        with self.store._lock:
+            idx = self.store.db.execute("SELECT ts, symbol, side, entry FROM signals WHERE source='engine' AND ts>=? "
+                                        "ORDER BY ts", (start_utc,)).fetchall()
+        like = f"S3M-%-{now:%Y%m%d}-%"                 # from the database, so a restart does not lose the count
+        with self.store._lock:
+            rows = self.store.db.execute("SELECT sid FROM paper_trades WHERE sid LIKE ? UNION SELECT sid FROM "
+                                         "option_trades WHERE sid LIKE ?", (like, like)).fetchall()
+        stock = sorted({r[0] for r in rows} | {k for k in self.b._legs if k.startswith("S3M-") and f"{now:%Y%m%d}" in k})
+        lines = [f"📅 Today {now:%d %b}, {now:%H:%M}"]
+        if idx:
+            lines.append(f"Index signals: {len(idx)}")
+            for ts, sym, side, entry in idx[-10:]:
+                lines.append(f"  • {datetime.fromisoformat(ts).astimezone(IST):%H:%M} {sym} {side} {entry:,.1f}")
+        else:
+            lines.append("Index signals (NIFTY/SENSEX): none yet")
+        lines.append(f"Stock 3-min signals: {len(stock)}" + (" (e.g. " + ", ".join(s.split('-')[1] for s in stock[-5:]) + ")"
+                                                             if stock else ""))
+        for a in self.b.accounts:
+            with self.store._lock:
+                f = self.store.db.execute("SELECT action, realized FROM account_fills WHERE acct=? AND substr(ts,1,10)=?",
+                                          (a.name, day)).fetchall()
+            buys = sum(x == "BUY" for x, _ in f)
+            real = sum(r for x, r in f if x == "SELL")
+            eq, st = a.equity(), a.day_start_equity(day)
+            lines.append(f"💼 {a.name}: {buys} trades taken, realised {'+' if real >= 0 else '−'}₹{abs(real):,.0f} after "
+                         f"costs, equity ₹{eq:,.0f} ({(eq / st - 1) * 100:+.2f}% today), {len(a.positions)} open")
+        lines.append("Paper trading only · no orders placed")
+        return self.reply("\n".join(lines))
+
+    # ---------- admin: control ----------
+    def cmd_pause(self, args, raw):
+        self.b.risk.set_halted(True)
+        for a in self.b.accounts:
+            a.set_paused(True)
+        self.store.add_event("admin", {"cmd": "pause", "chat": self.chat})
+        return self.reply("⏸ Paused: no new paper entries (books and accounts). Open positions keep their stops. /resume")
+
+    cmd_halt = cmd_pause
+
+    def cmd_resume(self, args, raw):
+        self.b.risk.set_halted(False)
+        for a in self.b.accounts:
+            a.set_paused(False)
+        self.store.add_event("admin", {"cmd": "resume", "chat": self.chat})
+        return self.reply("▶️ Resumed: new paper entries allowed.")
+
+    def _ask_confirm(self, action: str, what: str) -> str:
+        code = f"{secrets.randbelow(9000) + 1000}"
+        self._confirm[self.chat or "local"] = (code, action, time.time() + CONFIRM_TTL_S)
+        return self.reply(f"⚠️ {what}\nSend /confirm {code} within {CONFIRM_TTL_S} s to go ahead.")
+
+    def cmd_confirm(self, args, raw):
+        c = self._confirm.pop(self.chat or "local", None)
+        if not c or not args or args[0] != c[0] or time.time() > c[2]:
+            return self.reply("Nothing to confirm (wrong or expired code).")
+        action = c[1]
+        self.store.add_event("admin", {"cmd": action, "chat": self.chat})
+        if action.startswith("close "):
+            out = []
+            for a in self.b.accounts:
+                out += a.close(self.b.now(), action.split(" ", 1)[1])
+            return self.reply("\n".join(out) or "No matching open position.")
+        if action.startswith("reset"):
+            cap = float(action.split(" ", 1)[1]) if " " in action else None
+            return self.reply("\n".join(a.reset(self.b.now(), cap) for a in self.b.accounts))
+        if action == "restart":
+            self.restart_requested = True
+            return self.reply("🔄 Restarting the bridge now; it will be back in about a minute.")
+        return self.reply("Nothing to confirm.")
+
+    def cmd_close(self, args, raw):
+        if not self.b.accounts:
+            return self.reply("The paper account is off.")
+        which = args[0].lower() if args else ""
+        if not which:
+            return self.reply("Usage: /close all, or /close <n> (the number /open shows)")
+        n = sum(len(a.positions) for a in self.b.accounts)
+        if not n:
+            return self.reply("No open positions.")
+        return self._ask_confirm(f"close {which}", f"Sell {'ALL ' + str(n) + ' open positions' if which == 'all' else 'position ' + which} "
+                                                   f"at the live bid now?")
+
+    def cmd_reset(self, args, raw):
+        cap = args[0].replace(",", "") if args else ""
+        if cap and not cap.replace(".", "").isdigit():
+            return self.reply("Usage: /reset [capital], e.g. /reset 500000")
+        return self._ask_confirm("reset" + (f" {cap}" if cap else ""),
+                                 "Reset the paper account's cash" + (f" to ₹{float(cap):,.0f}" if cap else " to its capital")
+                                 + "? The ledger keeps every past fill.")
+
+    def cmd_restart(self, args, raw):
+        return self._ask_confirm("restart", "Restart the bridge? (start.sh brings it back automatically)")
+
+    SETTABLE = {"risk": "risk_pct", "losslimit": "daily_loss_pct", "maxopen": "max_open", "costgate": "max_cost_share",
+                "deploy": "max_deploy_pct"}
+
+    def cmd_set(self, args, raw):
+        if len(args) != 2:
+            return self.reply("Usage: /set <risk|losslimit|maxopen|costgate|deploy|stockrisk> <value>\n"
+                              "e.g. /set risk 0.5 (percent of equity per trade)")
+        key, val = args[0].lower(), args[1].rstrip("%")
+        try:
+            v = float(val)
+        except ValueError:
+            return self.reply("The value must be a number.")
+        if key == "stockrisk":
+            if not 0 <= v <= 1:
+                return self.reply("stockrisk is the share of normal risk for stock signals, 0 to 1 (0 = never).")
+            self.b.s.stock_signal_risk = v
+            self.store.kv_set("set_stock_signal_risk", v)
+            out = f"Stock signals now trade at {v:g}× normal risk"
+        elif key in self.SETTABLE:
+            if not self.b.accounts:
+                return self.reply("The paper account is off.")
+            # the strategy accounts keep their registered rules (evidence/strategy_accounts_protocol.md)
+            out = "\n".join(a.set_param(self.SETTABLE[key], v) for a in self.b.accounts if a.strategy == "base")
+        else:
+            return self.reply(f"Unknown setting {key!r}.")
+        self.store.add_event("admin", {"cmd": "set", "key": key, "value": v, "chat": self.chat})
+        return self.reply("⚙️ " + out)
+
+    FEATURES = {"index": "the NIFTY/SENSEX engine", "stocks": "the 3-min stock engine", "scanner": "the F&O watchlist",
+                "gs": "the GS research engine (paper)"}
+
+    def cmd_toggle(self, args, raw):
+        if len(args) != 2 or args[0].lower() not in self.FEATURES or args[1].lower() not in ("on", "off"):
+            return self.reply("Usage: /toggle <index|stocks|scanner|gs> <on|off>")
+        f, on = args[0].lower(), args[1].lower() == "on"
+        self.store.kv_set(f"feature_off_{f}", not on)
+        self.store.add_event("admin", {"cmd": "toggle", "feature": f, "on": on, "chat": self.chat})
+        return self.reply(f"⚙️ {self.FEATURES[f]}: {'ON' if on else 'OFF'}")
+
+    # ---------- admin: people ----------
+    def cmd_users(self, args, raw):
+        tg = self.b.tg
+        if not hasattr(tg, "known_chats"):
+            return self.reply("No Telegram.")
+        muted = self.muted()
+        lines = ["👥 Chats"]
+        for c in sorted(tg.known_chats()):
+            role = "admin" if tg.is_admin(c) else "user"
+            lines.append(f"• {c}: {role}{' (main)' if c == tg.chat_id else ''}{' · muted' if c in muted else ''}")
+        return self.reply("\n".join(lines))
+
+    def _chat_arg(self, args) -> str | None:
+        return args[0] if args and re.fullmatch(r"-?\d{3,20}", args[0]) else None
+
+    def cmd_adduser(self, args, raw):
+        c = self._chat_arg(args)
+        if not c:
+            return self.reply("Usage: /adduser <chat id> (the id is in the access request, or the user's /myid)")
+        self._put("tg_users", self.users() | {c})
+        self.store.add_event("admin", {"cmd": "adduser", "user": c, "chat": self.chat})
+        self.b.tg.send("👋 The admin gave you access to the NFCE bot.\n\n" + USER_HELP, to=[c])
+        return self.reply(f"✅ {c} added as a user.")
+
+    def cmd_removeuser(self, args, raw):
+        c = self._chat_arg(args)
+        if not c or c not in self.users():
+            return self.reply("Usage: /removeuser <chat id> (only users added with /adduser can be removed)")
+        self._put("tg_users", self.users() - {c})
+        self.store.add_event("admin", {"cmd": "removeuser", "user": c, "chat": self.chat})
+        return self.reply(f"🚫 {c} removed.")
+
+    def cmd_mute(self, args, raw):
+        c = self._chat_arg(args)
+        if not c:
+            return self.reply("Usage: /mute <chat id>")
+        self._put("tg_muted", self.muted() | {c})
+        return self.reply(f"🔕 {c} muted (admins are never muted).")
+
+    def cmd_unmute(self, args, raw):
+        c = self._chat_arg(args)
+        if not c:
+            return self.reply("Usage: /unmute <chat id>")
+        self._put("tg_muted", self.muted() - {c})
+        return self.reply(f"🔔 {c} unmuted.")
+
+    def cmd_broadcast(self, args, raw):
+        text = raw.split(None, 1)[1] if len(raw.split(None, 1)) > 1 else ""
+        if not text:
+            return self.reply("Usage: /broadcast <message>")
+        targets = self.b.tg.broadcast_targets() if hasattr(self.b.tg, "broadcast_targets") else None
+        self.b.tg.send("📢 " + text, to=targets) if targets else self.b.tg.send("📢 " + text)
+        return self.reply(f"Sent to {len(targets) if targets else 1} chat(s).")
+
+    # ---------- admin: information ----------
+    def cmd_notes(self, args, raw):
+        n = int(args[0]) if args and args[0].isdigit() else 10
+        with self.store._lock:
+            rows = self.store.db.execute("SELECT ts, source, raw FROM events WHERE source IN ('telegram-note', "
+                                         "'telegram-admin', 'admin') ORDER BY id DESC LIMIT ?", (min(n, 50),)).fetchall()
+        if not rows:
+            return self.reply("No notes yet.")
+        import json
+        out = ["🗒 Latest notes and requests"]
+        for ts, src, rawj in reversed(rows):
+            d = json.loads(rawj)
+            who = {"telegram-admin": "admin", "admin": "admin action"}.get(src, f"from {d.get('chat', 'main')}")
+            body = d.get("text") or ", ".join(f"{k}={v}" for k, v in d.items() if k != "chat")
+            out.append(f"• {datetime.fromisoformat(ts).astimezone(IST):%d %b %H:%M} ({who}): {body[:300]}")
+        return self.reply("\n".join(out))
+
+    def cmd_errors(self, args, raw):
+        if not self.errors:
+            return self.reply("✅ No errors since the start.")
+        return self.reply("Recent errors:\n" + "\n".join(f"• {t:%H:%M:%S} {m[:200]}" for t, m in list(self.errors)[-15:]))
+
+    def cmd_config(self, args, raw):
+        s = self.b.s
+        feats = ", ".join(f"{k} {'off' if self.off(k) else 'on'}" for k in self.FEATURES)
+        lines = ["⚙️ Settings",
+                 f"Index signals: {', '.join(s.engine_underlyings) or 'none'} on {', '.join(map(str, s.engine_timeframes))}-min",
+                 f"Features: {feats} · option legs {'on' if s.option_legs else 'off'}",
+                 f"Watchlists at {', '.join(s.scanner_times)} ({s.scanner_mode})",
+                 f"Stock signals in the account: {s.stock_signal_risk:g}× risk",
+                 f"Paused: {'YES' if self.b.risk.halted() else 'no'}",
+                 f"Uptime: {timedelta(seconds=int(time.time() - self.started))}"]
+        for a in self.b.accounts:
+            lines.append(f"💼 {a.name}: {a.settings_line()}")
+        try:
+            import resource
+            lines.append(f"Memory: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6:.0f} MB peak · "
+                         f"database {self.b.s.db_path.stat().st_size / 1e6:.1f} MB")
+        except (ImportError, OSError):
+            pass
+        return self.reply("\n".join(lines))
+
+    def cmd_report(self, args, raw):
+        return self.reply(self.b.report_text())
+
+    def cmd_export(self, args, raw):
+        sent = []
+        if self.b.accounts:
+            p = self.b.export_ledger()
+            self.b.tg.send_document(p, "Paper account ledger")
+            sent.append(p.name)
+        p = self.export_signals()
+        self.b.tg.send_document(p, "Signals (all, with the option-chain decision)")
+        sent.append(p.name)
+        return f"sent: {', '.join(sent)}"
+
+    def export_signals(self):
+        import csv
+        path = self.b.s.db_path.parent / f"signals_{self.b.now():%Y-%m-%d}.csv"
+        with self.store._lock:
+            cur = self.store.db.execute("SELECT ts, source, sid, symbol, side, entry, sl, t1, action, grade_out, flow, "
+                                        "basis, delay_s FROM signals ORDER BY id")
+            cols = [c[0] for c in cur.description]
+            rows = cur.fetchall()
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            w.writerows(rows)
+        return path
+
+    def cmd_backup(self, args, raw):
+        p = self.backup()
+        return self.reply(f"💾 Database copied to {p.name}" if p else "⚠️ Backup failed (see /errors).")
+
+    def backup(self, keep: int = 10):
+        folder = self.b.s.db_path.parent / "backups"
+        try:
+            folder.mkdir(exist_ok=True)
+            dest = folder / f"nfce_{self.b.now():%Y%m%d_%H%M}.db"
+            with self.store._lock:
+                out = sqlite3.connect(dest)
+                self.store.db.backup(out)              # consistent copy even while the bridge writes
+                out.close()
+            for old in sorted(folder.glob("nfce_*.db"))[:-keep]:
+                old.unlink()
+            return dest
+        except (OSError, sqlite3.Error) as exc:
+            self.note_error(f"backup: {type(exc).__name__}: {exc}")
+            return None
+
+    # ---------- admin: Upstox sign-in from the phone ----------
+    def cmd_login(self, args, raw):
+        from .upstox_login import auth_url
+        s = self.b.s
+        if not (s.upstox_api_key and s.upstox_api_secret):
+            return self.reply("UPSTOX_API_KEY / UPSTOX_API_SECRET are not set in .env.")
+        self._login_state = secrets.token_urlsafe(12)
+        return self.reply("🔑 Upstox sign-in\n1. Open this link and sign in on Upstox's own page (you type your details "
+                          "there; the bot never sees them):\n" + auth_url(s, self._login_state) +
+                          "\n2. Afterwards the browser tries to open a 127.0.0.1 address. On a phone that page will not "
+                          "load: that is expected.\n3. Copy that whole address from the address bar and send:\n"
+                          "/code <the address>\nThe code inside is single-use and expires in a few minutes.")
+
+    def cmd_code(self, args, raw):
+        from .upstox_login import LoginError, code_from, exchange_code
+        text = raw.split(None, 1)[1] if len(raw.split(None, 1)) > 1 else ""
+        if not self._login_state:
+            return self.reply("Send /login first.")
+        try:
+            exp = exchange_code(self.b.s, code_from(text, self._login_state))
+        except LoginError as exc:
+            return self.reply(f"⚠️ {exc}")
+        self._login_state = None
+        self.b._token_warned = False
+        self.store.add_event("admin", {"cmd": "login", "chat": self.chat})
+        return self.reply(f"✅ Upstox token saved, valid until {exp:%d %b %H:%M} IST. Market data resumes on the next poll.")
+
+    # ---------- jobs (called on every poll tick) ----------
+    def note_error(self, msg: str) -> None:
+        now = self.b.now()
+        self.errors.append((now, msg))
+        recent = [t for t, _ in self.errors if (now - t).total_seconds() < 600]
+        hour = f"err_burst_{now:%Y%m%d%H}"
+        if len(recent) >= 20 and not self.store.kv_get(hour):
+            self.store.kv_set(hour, True)
+            self.admin(f"⚠️ {len(recent)} errors in the last 10 minutes. Latest: {msg[:300]}\n/errors shows them.")
+
+    def tick(self, now: datetime) -> None:
+        n = now.astimezone(IST)
+        self._access_requests(n)
+        if n.weekday() >= 5:
+            return
+        mins = n.hour * 60 + n.minute
+        self._token_watch(n, mins)
+        if 9 * 60 + 5 <= mins < 9 * 60 + 20:
+            self._once(f"brief_{n.date()}", lambda: self.b.tg.send(self.morning_brief(n)))
+        if 9 * 60 + 15 <= mins < 15 * 60 + 30:
+            self._watchdog(n)
+        if 15 * 60 + 35 <= mins < 16 * 60 + 30:
+            self._once(f"eod_{n.date()}", lambda: self._end_of_day(n))
+
+    def _once(self, key: str, fn) -> None:
+        if self.store.kv_get(key):
+            return
+        self.store.kv_set(key, True)
+        try:
+            fn()
+        except Exception:
+            log.exception("bot job %s failed", key)
+
+    def _access_requests(self, n: datetime) -> None:
+        tg = self.b.tg
+        reqs, tg.requests = list(getattr(tg, "requests", [])), []
+        for cid, name, text in reqs:
+            key = (cid, n.date().isoformat())
+            if key in self._requests_told:
+                continue
+            self._requests_told.add(key)
+            self.admin(f"🔐 Access request from {name or 'someone'} (chat {cid}): \"{text[:120]}\"\n"
+                       f"Allow with /adduser {cid}")
+            tg.send("This is a private bot. Your request has been passed to the admin "
+                    f"(your chat id is {cid}).", to=[cid])
+
+    def _token_watch(self, n: datetime, mins: int) -> None:
+        if self.b.s.provider != "upstox" or not (8 * 60 <= mins < 15 * 60 + 30):
+            return
+        from .check_setup import token_status
+        ok, msg = token_status(self.b.s.token_file)
+        if ok:
+            return
+        slot = "a" if mins < 9 * 60 else ("b" if mins < 9 * 60 + 15 else "c")    # at most three reminders a day
+        self._once(f"token_alert_{n.date()}_{slot}",
+                   lambda: self.admin(f"🔑 {msg}.\nSign in from your phone: send /login (or run bash start.sh on the Mac)."
+                                      + (" Market opens at 09:15." if slot != "c" else "")))
+
+    def _watchdog(self, n: datetime) -> None:
+        h = self.b.health_status()
+        now = time.time()
+        current = {p for p in h["problems"] if not p.startswith("halted")}
+        for p in current:
+            first, alerted = self._problems.get(p, (now, False))
+            if not alerted and now - first >= ALERT_AFTER_S:
+                self.admin(f"⚠️ {p} (for {int((now - first) / 60)} min). Last error: {h.get('last_error') or 'none'}")
+                alerted = True
+            self._problems[p] = (first, alerted)
+        for p in list(self._problems):
+            if p not in current:
+                if self._problems[p][1]:
+                    self.admin(f"✅ Recovered: {p}")
+                del self._problems[p]
+        ac, pct = power_status()                   # live 22 Oct: on battery all morning (caffeinate then only
+        if ac is False:                            # blocks idle sleep; a closed lid or an empty battery stops all)
+            self._once(f"battery_{n.date()}", lambda: self.admin(
+                f"🔋 The Mac is on battery ({pct}%). Please connect the charger and keep the lid open."))
+            if pct is not None and pct <= LOW_BATTERY_PCT:
+                self._once(f"battery_low_{n.date()}", lambda: self.admin(
+                    f"🪫 Low battery: {pct}%. Connect the charger now, or the system stops when the Mac sleeps."))
+
+    def morning_brief(self, n: datetime) -> str:
+        s, h = self.b.s, self.b.health_status()
+        lines = [f"☀️ Good morning · {n:%a %d %b}",
+                 "✅ System running" if h["ok"] else "⚠️ " + "; ".join(h["problems"]),
+                 f"Signals: {', '.join(s.engine_underlyings) or 'webhooks'} on {', '.join(map(str, s.engine_timeframes))}-min "
+                 "candles, from the bar after 09:30",
+                 ({"trade": f"Scanner at {', '.join(s.scanner_times)}: picks are paper-traded in their own book, "
+                            "outside the accounts (tested: no edge after costs)",
+                   "sell": f"Scanner at {', '.join(s.scanner_times)}: SELL picks (losers) paper-traded outside the "
+                           "accounts; gainers watch-only (buying gainers lost in every test)"}
+                  .get(s.scanner_mode, f"Watchlists at {', '.join(s.scanner_times)} (to watch, not to buy)"))
+                 if s.scanner else ""]
+        for a in self.b.accounts:
+            lines.append(f"💼 {a.name}: equity ₹{a.equity():,.0f} · {a.settings_line()}")
+        try:                                           # 22 Oct evening: the preflight's problems, if any
+            from . import preflight
+            lines += [f"⚠️ {msg}" for ok, msg in preflight.checks() if not ok]
+        except Exception:
+            log.exception("preflight in the morning brief failed")
+        lines.append("Paper trading only · no orders placed · /help")
+        return "\n".join(x for x in lines if x)
+
+    def _end_of_day(self, n: datetime) -> None:
+        if self.b.accounts:
+            p = self.b.export_ledger()
+            f = getattr(self.b.tg, "send_document", None)
+            if f:
+                f(p, f"Ledger {n:%d %b} (end of day)", to=sorted(getattr(self.b.tg, "admins", [])) or None)
+        dest = self.backup()
+        self.admin("🌙 End of day: ledger sent, database backed up" + (f" ({dest.name})" if dest else " (backup FAILED)")
+                   + f". Errors today: {sum(t.date() == n.date() for t, _ in self.errors)}.")

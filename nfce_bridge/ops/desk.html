@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NFCE Desk</title>
+<style>
+:root{--bg:#0a0d12;--panel:#121722;--sunk:#192030;--fg:#e7ebf2;--muted:#8a95a8;--line:#232c3b;--accent:#6ea1ff;
+ --gain:#3ecf8e;--loss:#ff6b61;--amber:#f2b54b;--crit:#ff4d6a;--mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,monospace;
+ --sans:-apple-system,"Inter","Segoe UI",system-ui,sans-serif;color-scheme:dark}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13.5px/1.45 var(--sans)}
+header{position:sticky;top:0;z-index:5;background:linear-gradient(var(--bg),var(--bg));border-bottom:1px solid var(--line)}
+.top{display:flex;gap:14px;align-items:center;padding:9px 16px;flex-wrap:wrap}
+.brand{font:700 15px var(--sans);letter-spacing:.04em;display:flex;align-items:center;gap:8px}
+.brand i{width:9px;height:9px;border-radius:50%;background:var(--muted);display:inline-block}
+.brand i.live{background:var(--gain);box-shadow:0 0 0 0 rgba(62,207,142,.6);animation:pulse 2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(62,207,142,.55)}70%{box-shadow:0 0 0 8px rgba(62,207,142,0)}100%{box-shadow:0 0 0 0 rgba(62,207,142,0)}}
+.ticker{display:flex;gap:16px;font:600 12.5px var(--mono);flex-wrap:wrap}
+.ticker span b{color:var(--muted);font-weight:600;margin-right:5px}
+.pills{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto}
+.pill{font:600 11.5px var(--mono);padding:3px 8px;border-radius:999px;background:var(--sunk);color:var(--muted);white-space:nowrap}
+.pill.ok{color:var(--gain)}.pill.warn{color:var(--amber)}.pill.bad{color:var(--loss)}
+nav{display:flex;gap:2px;padding:0 12px;overflow-x:auto}
+nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);font:600 13px var(--sans);padding:8px 12px;cursor:pointer;white-space:nowrap}
+nav button.on{color:var(--fg);border-bottom-color:var(--accent)}
+nav button .n{font:600 10.5px var(--mono);background:var(--crit);color:#fff;border-radius:8px;padding:0 5px;margin-left:5px}
+#alerts{display:flex;flex-direction:column;gap:4px;padding:8px 16px 0}
+.al{display:flex;gap:8px;align-items:center;padding:6px 10px;border-radius:7px;font-size:13px;background:var(--sunk);border-left:3px solid var(--muted)}
+.al.crit{border-left-color:var(--crit);background:rgba(255,77,106,.10)}.al.warn{border-left-color:var(--amber)}.al.info{border-left-color:var(--accent)}
+.al b{font:700 10.5px var(--mono);text-transform:uppercase;letter-spacing:.06em;min-width:34px}
+.al .x{margin-left:auto;background:none;border:0;color:var(--muted);font:600 15px var(--sans);cursor:pointer;padding:0 4px;line-height:1}.al .x:hover{color:var(--fg)}
+#alerts .rs{background:none;border:0;color:var(--muted);font-size:12px;cursor:pointer;text-align:left;padding:0}
+main{padding:12px 16px 30px}
+.tab{display:none;gap:12px;grid-template-columns:repeat(12,1fr)}.tab.on{display:grid}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;min-width:0;overflow:hidden}
+.card h2{margin:0 0 9px;font:600 11px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.09em;display:flex;justify-content:space-between;gap:8px}
+.s12{grid-column:span 12}.s8{grid-column:span 8}.s7{grid-column:span 7}.s6{grid-column:span 6}.s5{grid-column:span 5}.s4{grid-column:span 4}.s3{grid-column:span 3}
+@media(max-width:1100px){.s8,.s7,.s6,.s5,.s4,.s3{grid-column:span 12}}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.kpi{background:var(--sunk);border-radius:8px;padding:10px 12px}.kpi .l{color:var(--muted);font-size:12px}.kpi .v{font:700 20px var(--mono);margin-top:2px}
+.accts{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.acct{background:var(--sunk);border-radius:8px;padding:10px}.acct .n{font-weight:700;font-size:14px}.acct .s{color:var(--muted);font-size:11.5px;font-weight:500}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}.big{font:700 17px var(--mono)}
+.g{color:var(--gain)}.r{color:var(--loss)}.a{color:var(--amber)}.m{color:var(--muted)}
+svg.spark{width:100%;height:34px;display:block;margin-top:4px}
+.tw{overflow:auto;max-height:380px}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{text-align:left;padding:5px 7px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font:600 10.5px var(--mono);text-transform:uppercase;letter-spacing:.05em;position:sticky;top:0;background:var(--panel)}
+td.n,th.n{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+.bar{height:7px;border-radius:4px;background:var(--sunk);position:relative;overflow:hidden;min-width:70px}.bar i{position:absolute;inset:0 auto 0 0;border-radius:4px}
+.heat td{text-align:right;font-family:var(--mono);font-size:12px}
+.msg{padding:6px 0;border-bottom:1px solid var(--line);font-size:12.5px}.msg .t{color:var(--muted);font:11.5px var(--mono)}
+.tag{font:600 10.5px var(--mono);padding:2px 6px;border-radius:4px;background:var(--sunk)}
+.err{color:var(--amber);font:12px var(--mono);padding:8px;background:rgba(242,181,75,.08);border-radius:6px}
+.empty{color:var(--muted);padding:10px 2px}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;margin-top:6px}.legend i{display:inline-block;width:10px;height:3px;margin-right:5px;vertical-align:middle}
+footer{padding:0 16px 24px;color:var(--muted);font-size:11.5px}
+.btn{font:600 11.5px var(--sans);border:1px solid var(--line);background:var(--sunk);color:var(--fg);border-radius:6px;padding:3px 9px;cursor:pointer;margin-left:4px}
+.btn:hover{border-color:var(--muted)}.btn.danger{border-color:var(--crit);color:var(--crit)}.btn.ok{border-color:var(--gain);color:var(--gain)}
+.btn:disabled{opacity:.45;cursor:wait}.acct .ctl{margin-top:6px;display:flex;gap:4px;flex-wrap:wrap}.acct .ctl .btn{margin-left:0}
+.badge{font:700 10px var(--mono);padding:1px 5px;border-radius:4px;background:rgba(242,181,75,.15);color:var(--amber);margin-left:6px}
+#gate{display:none;padding:16px}#gate.on{display:block}#gate input{width:100%;max-width:420px;padding:8px;border-radius:6px;border:1px solid var(--line);background:var(--sunk);color:var(--fg);font:13px var(--mono)}
+.chips{display:flex;gap:6px;flex-wrap:wrap}.chip{font:600 12px var(--sans);border:1px solid var(--line);background:var(--sunk);color:var(--fg);border-radius:14px;padding:4px 11px;cursor:pointer}.chip.on{border-color:var(--accent);color:var(--accent)}
+.ticket{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.ticket input{padding:7px 9px;border-radius:6px;border:1px solid var(--line);background:var(--sunk);color:var(--fg);font:13px var(--mono)}#tund{width:200px}#tlots{width:64px}
+.sellbox{display:flex;gap:4px;align-items:center}.sellbox input{width:48px;padding:3px 5px;border-radius:5px;border:1px solid var(--line);background:var(--sunk);color:var(--fg);font:12px var(--mono)}
+.link{font:12px var(--mono);word-break:break-all;background:var(--sunk);padding:6px 8px;border-radius:6px;margin:4px 0 10px}
+@media(max-width:640px){main{padding:8px 8px 24px}.card{padding:10px}.kpis,.accts{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .kpi .v{font-size:17px}nav button{padding:8px 9px}.top{flex-wrap:wrap;gap:6px}table{font-size:12px}th,td{padding:4px 5px}}
+</style></head><body>
+<header>
+ <div class="top"><div class="brand"><i id="dot"></i>NFCE DESK</div><div class="ticker" id="ticker"></div><div class="pills" id="pills"></div></div>
+ <nav id="tabs"></nav>
+</header>
+<div id="alerts"></div>
+<div id="gate"><b>This device needs a desk link.</b><p class="m">On the Mac, open the desk → System tab → "Open on your phone", and use that link here. Or paste the token:</p>
+ <input id="tok" placeholder="token" autocomplete="off"> <button class="btn" id="tokgo">Use token</button></div>
+<main>
+ <section class="tab on" data-tab="live">
+  <div class="card s12"><h2>Book summary <span id="asof" class="m"></span></h2><div class="kpis" id="kpis"></div></div>
+  <div class="card s12"><h2>Accounts (paper) · intraday equity</h2><div class="accts" id="accts"></div></div>
+  <div class="card s8"><h2>Pre-trade limits</h2><div class="tw"><table id="limits"></table></div></div>
+  <div class="card s4"><h2>P&amp;L by book (closed)</h2><div class="tw"><table id="books"></table></div></div>
+  <div class="card s6"><h2>Signal blotter</h2><div class="tw"><table id="signals"></table></div></div>
+  <div class="card s6"><h2>Fills &amp; costs</h2><div id="tca" class="num m" style="margin-bottom:6px"></div><div class="tw"><table id="fills"></table></div></div>
+ </section>
+ <section class="tab" data-tab="trade">
+  <div class="card s12"><h2>Accounts <span class="m" id="tclock"></span></h2><div class="chips" id="tsel"></div><div class="kpis" id="tkpis" style="margin-top:10px"></div></div>
+  <div class="card s12" id="ticketcard" hidden><h2>Order ticket · MAN (your own account; the strategy accounts never take manual buys)</h2>
+   <div class="ticket"><input id="tund" list="tuni" placeholder="NIFTY, SENSEX, RELIANCE…" autocomplete="off"><datalist id="tuni"></datalist>
+   <input id="tlots" type="number" min="1" max="100" value="1"><span class="m">lots</span>
+   <button class="btn ok" id="tcall">Buy CALL (up)</button><button class="btn danger" id="tput">Buy PUT (down)</button></div>
+   <div class="m" style="font-size:11.5px;margin-top:6px">Buys the 1-ITM option at the ask (the engine's own strike rule and spread check). No automatic stop or target: you sell it here, or it is squared off at 15:15. Paper only.</div></div>
+  <div class="card s12"><h2>Chart · 1-min from the live stream</h2>
+   <div class="ticket"><input id="cund" list="tuni" value="NIFTY" autocomplete="off" style="width:160px"><button class="btn" id="cgo">Show</button><span class="m num" id="cread"></span></div>
+   <div id="chart" style="margin-top:8px"></div>
+   <div class="legend"><span><i style="background:#c9d1e0"></i>price</span><span><i style="background:#f2b54b"></i>VWAP (stocks)</span><span><i style="background:#6ea1ff"></i>EMA 9</span><span><i style="background:#c58aff"></i>EMA 21</span><span><i style="background:#3ecf8e"></i>signal T1</span><span><i style="background:#ff6b61"></i>signal stop</span><span class="m">signal levels drawn at the spot price of their minute · indicators describe, they do not predict</span></div></div>
+  <div class="card s12"><h2>Open positions · live (1 s)</h2><div class="tw"><table id="tpos"></table></div></div>
+  <div class="card s12"><h2>Signals today (newest first) · <span class="m" style="font-weight:500;text-transform:none;letter-spacing:0">no signal type here has a proven edge after costs; "result" is the system's own futures paper book</span></h2><div class="tw" style="max-height:340px"><table id="tsig"></table></div></div>
+  <div class="card s12"><h2>Trades today</h2><div class="tw"><table id="tfills"></table></div></div>
+ </section>
+ <section class="tab" data-tab="risk">
+  <div class="card s12"><h2>Exposure</h2><div class="kpis" id="rkpis"></div></div>
+  <div class="card s7"><h2>Open positions · live marks &amp; Greeks</h2><div class="tw"><table id="positions"></table></div></div>
+  <div class="card s5"><h2>Scenario P&amp;L (Δ·dS + ½Γ·dS² + vega·dIV)</h2><div id="grid"></div></div>
+  <div class="card s12"><h2>By underlying</h2><div class="tw"><table id="byund"></table></div></div>
+ </section>
+ <section class="tab" data-tab="perf">
+  <div class="card s12"><h2>Return since inception, % of each account's capital (daily close)</h2><div id="curve"></div></div>
+  <div class="card s12"><h2>Account statistics</h2><div class="tw"><table id="pstats"></table></div></div>
+ </section>
+ <section class="tab" data-tab="research">
+  <div class="card s4"><h2>GS engine (own ₹5 L)</h2><div id="gs"></div></div>
+  <div class="card s4"><h2>SCALP-1 (today's ticks)</h2><div id="scalp"></div></div>
+  <div class="card s4"><h2>Overnight premium</h2><div id="ovn"></div></div>
+  <div class="card s12"><h2>Research scorecard (locked tests, after costs)</h2><div class="tw"><table id="score"></table></div></div>
+ </section>
+ <section class="tab" data-tab="system">
+  <div class="card s6"><h2>Bridge feeds &amp; engines</h2><div id="feeds"></div></div>
+  <div class="card s6"><h2>Streaming feed (WebSocket)</h2><div id="stream"></div></div>
+  <div class="card s6"><h2>Messages in (audit)</h2><div class="tw" id="min"></div></div>
+  <div class="card s6"><h2>Messages out (audit)</h2><div class="tw" id="mout"></div></div>
+  <div class="card s6"><h2>Control log (every desk and Telegram action)</h2><div class="tw" id="ctllog"></div></div>
+  <div class="card s6"><h2>Open on your phone (same Wi-Fi)</h2><div id="links"></div></div>
+ </section>
+</main>
+<footer>Paper trading only: no orders exist anywhere in NFCE. Desk controls act on the paper accounts and are logged. Refresh every 5 s · research panels cached 2–5 min.</footer>
+<script>
+const AL_TTL=30000,AL_SEEN={},AL_HIDE=new Set(),alKey=a=>a.level+"|"+String(a.text).replace(/[0-9.,]+/g,"#");
+document.addEventListener("click",e=>{const x=e.target.closest("#alerts .x");if(x){AL_HIDE.add(x.dataset.k);x.parentElement.remove();return}
+ if(e.target.closest("#alerts .rs")){AL_HIDE.clear();for(const k in AL_SEEN)AL_SEEN[k]=Date.now();e.target.remove()}});
+
+let TOKEN="";try{const u=new URL(location.href),t=u.searchParams.get("t");if(t){localStorage.setItem("desk-token",t);u.searchParams.delete("t");history.replaceState(null,"",u.pathname)}
+ TOKEN=localStorage.getItem("desk-token")||""}catch(e){}
+const H=()=>TOKEN?{"X-Desk-Token":TOKEN}:{};
+let ROLE=null,LAST=null;
+async function act(body,question){if(!confirm(question))return;
+ const r=await fetch("/api/control",{method:"POST",headers:{...H(),"Content-Type":"application/json"},body:JSON.stringify(body)});
+ let j={};try{j=await r.json()}catch(e){}
+ alert(r.ok?((j.result||[]).join("\n")||"Done."):`Not done (HTTP ${r.status}): ${j.detail||""}`);tick();liveTick()}
+document.addEventListener("click",e=>{const b=e.target.closest("[data-act]");if(!b||ROLE!=="control")return;const D=b.dataset;
+ const q={close:`SELL ${D.label} in ${D.acct} now at the live bid?\n(Logged as MANUAL; kept out of the strategy scores.)`,
+  close_all:`SELL EVERY open position in ${D.acct} now at the live bid? (MANUAL)`,
+  pause:`Pause new entries in ${D.acct}? Open positions keep their stops.`,resume:`Resume new entries in ${D.acct}?`,
+  halt:"HALT ALL: stop new entries in every account and the books? Open positions keep their stops.",unhalt:"Resume new entries everywhere?"}[D.act];
+ act({action:D.act,acct:D.acct||"",sid:D.sid||""},q)});
+const $=s=>document.querySelector(s);
+const inr=n=>n==null||isNaN(n)?"—":(n<0?"−₹":"₹")+Math.abs(Math.round(n)).toLocaleString("en-IN");
+const pct=(n,d=2)=>n==null||isNaN(n)?"—":(n>=0?"+":"")+n.toFixed(d)+"%";
+const cls=n=>n>0?"g":n<0?"r":"m";
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const TABS=[["live","Live"],["trade","Trade"],["risk","Risk"],["perf","Performance"],["research","Research"],["system","System"]];
+let tab="live";try{tab=localStorage.getItem("desk-tab")||"live"}catch(e){}
+$("#tabs").innerHTML=TABS.map(([k,l])=>`<button data-k="${k}">${l}<span class="n" id="n-${k}" hidden></span></button>`).join("");
+function show(k){tab=k;document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b.dataset.k===k));
+ document.querySelectorAll(".tab").forEach(s=>s.classList.toggle("on",s.dataset.tab===k));try{localStorage.setItem("desk-tab",k)}catch(e){}}
+document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{show(b.dataset.k);if(b.dataset.k==="trade"&&typeof liveTick==="function"){liveTick();chartTick()}});show(tab);
+const bad=v=>v&&typeof v==="object"&&!Array.isArray(v)&&v.error;
+function panel(sel,fn){const el=$(sel);try{fn(el)}catch(e){el.innerHTML=`<div class="err">This panel failed to render: ${esc(e.message)}</div>`}}
+function guard(el,v,empty){if(bad(v)){el.innerHTML=`<div class="err">Data source failed: ${esc(v.error)}</div>`;return false}
+ if(v==null||(Array.isArray(v)&&!v.length)){el.innerHTML=`<div class="empty">${empty||"Nothing yet."}</div>`;return false}return true}
+function spark(curve){if(!curve||curve.length<2)return '<svg class="spark"></svg>';
+ const v=curve.map(c=>c[1]),lo=Math.min(...v),hi=Math.max(...v),w=200,h=34,sp=(hi-lo)||1;
+ const pts=v.map((y,i)=>`${(i/(v.length-1)*w).toFixed(1)},${(h-3-(y-lo)/sp*(h-6)).toFixed(1)}`).join(" ");
+ return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="${v[v.length-1]>=v[0]?"var(--gain)":"var(--loss)"}" stroke-width="1.6"/></svg>`}
+function bar(u){const p=Math.min(1,Math.max(0,u||0)),c=p>=.9?"var(--loss)":p>=.6?"var(--amber)":"var(--gain)";return `<div class="bar"><i style="width:${(p*100).toFixed(0)}%;background:${c}"></i></div>`}
+const age=t=>t?Math.round((Date.now()-Date.parse(t))/1000):null;
+function render(d){
+ const h=d.health||{},sy=d.system||{},st=d.stream||{};ROLE=d.role;LAST=d;$("#gate").classList.remove("on");
+ panel("#ctllog",el=>{if(!guard(el,d.control_log,"No control actions today."))return;el.innerHTML=`<table><tr><th>Time</th><th>Action</th><th>Account</th><th>Via</th><th>Result</th></tr>`+
+  d.control_log.map(c=>`<tr><td class="m">${esc(c.ts)}</td><td>${esc(c.cmd)}${c.sid?" "+esc(c.sid):""}</td><td>${esc(c.acct||"all")}</td><td class="m">${esc(c.via||"telegram")} ${esc(c.device||c.chat||"")}</td><td>${esc((c.result||[]).join(" · ")||"…")}</td></tr>`).join("")+"</table>"});
+ panel("#links",el=>{const L=d.links;if(!L){el.innerHTML=`<div class="empty">${d.role==="control"?"Shown on the Mac's own screen when the desk runs with --lan.":"Open the desk on the Mac to get the links."}</div>`;return}
+  if(!L.ip){el.innerHTML='<div class="err">No Wi-Fi address found: is the Mac on Wi-Fi?</div>';return}
+  el.innerHTML=`<div class="m">VIEW (read-only, safe to share at home):</div><div class="link">${esc(L.view)}</div><div class="m">CONTROL (can close and pause; keep private):</div><div class="link">${esc(L.control)}</div>
+  <div class="m" style="font-size:11.5px">Open on a phone on the same Wi-Fi. The token is saved on that phone, then removed from the address bar. If macOS asked to allow incoming connections for Python, choose Allow.</div>`});
+ $("#dot").className=h.up?"live":"";
+ panel("#ticker",el=>{const ix=(st.indices)||{};el.innerHTML=["NIFTY","BANKNIFTY","SENSEX","VIX"].map(k=>{const x=ix[k];
+   return `<span><b>${k}</b>${x&&x.ltp?x.ltp.toLocaleString("en-IN",{maximumFractionDigits:2}):"—"} <span class="${cls(x&&x.chg_pct)}">${x?pct(x.chg_pct):""}</span></span>`}).join("")});
+ panel("#pills",el=>{const pb=age(h.poll_beat);el.innerHTML=[
+   [h.up?"bridge up":"bridge down",h.up?(h.ok?"ok":"warn"):"bad"],
+   [pb!=null?`poll ${pb}s`:"poll —",pb!=null&&pb<30?"ok":"warn"],
+   [st.available?`stream ${st.age_s!=null?Math.round(st.age_s)+"s":"—"}`:"stream off",st.available&&st.age_s<30?"ok":"warn"],
+   ["regime "+((st.regime&&st.regime.text)||"unknown"),st.regime&&st.regime.vol==="stressed"?"bad":st.regime&&st.regime.vol==="calm"?"ok":"warn"],
+   [sy.token_ok?"token ok":"token expired",sy.token_ok?"ok":"bad"],
+   [sy.on_battery?`battery ${sy.battery_pct}%`:"on charger",sy.on_battery?(sy.battery_pct<=25?"bad":"warn"):"ok"],
+   ["GS "+String(h.gs||"offline").split("|")[0].trim().slice(0,22),String(h.gs||"").startsWith("FROZEN")?"ok":"warn"]
+  ].map(([t,c])=>`<span class="pill ${c}">${esc(t)}</span>`).join("")
+  +`<span class="pill ${d.role==="control"?"ok":"warn"}">${esc(d.role||"?")}</span>`
+  +(d.role==="control"?(d.halted?`<button class="btn ok" data-act="unhalt">RESUME ALL</button>`:`<button class="btn danger" data-act="halt">HALT ALL</button>`):"")
+  +(d.halted?`<span class="pill bad">HALTED</span>`:"")});
+ panel("#alerts",el=>{const all=Array.isArray(d.alerts)?d.alerts:[],now=Date.now();
+  // warn/info: dismiss with × or auto-hide 30 s after first seen; crit always stays. Key ignores digits (battery 27% → 26% is the same alert)
+  all.forEach(a=>{const k=alKey(a);if(!(k in AL_SEEN))AL_SEEN[k]=now});
+  const al=all.filter(a=>a.level==="crit"||!(AL_HIDE.has(alKey(a))||now-AL_SEEN[alKey(a)]>=AL_TTL)),hid=all.length-al.length;
+  el.innerHTML=al.slice(0,6).map(a=>`<div class="al ${a.level}"><b>${a.level}</b>${esc(a.text)}${a.level==="crit"?"":`<button class="x" title="Dismiss" data-k="${esc(alKey(a))}">×</button>`}</div>`).join("")+(al.length>6?`<div class="m" style="font-size:12px">+${al.length-6} more</div>`:"")+(hid?`<button class="rs">show ${hid} hidden</button>`:"");
+  const n=al.filter(a=>a.level!=="info").length,b=$("#n-live");b.hidden=!n;b.textContent=n});
+ $("#asof").textContent=`${d.day} · updated ${d.generated}`;
+ panel("#kpis",el=>{if(!guard(el,d.accounts))return;const A=d.accounts;
+  const eq=A.reduce((s,a)=>s+a.equity,0),day=A.reduce((s,a)=>s+a.day_pnl,0),open=A.reduce((s,a)=>s+a.open,0),fees=A.reduce((s,a)=>s+a.fees,0);
+  const leg=l=>Array.isArray(d.books)?d.books.filter(b=>b.leg===l).reduce((s,b)=>s+b.closed_pnl,0):null;
+  const bf=leg("futures"),bo=leg("options");   // two ways of trading the SAME signals: never add them together
+  const ex=(d.risk&&d.risk.exposure&&d.risk.exposure.total)||{};
+  el.innerHTML=[["Six accounts equity",inr(eq),""],["Accounts today",(day>=0?"+":"")+inr(day),cls(day)],["Open positions",open,""],
+   ["Unrealised (live marks)",inr(ex.unrealized),cls(ex.unrealized)],["Fees today",inr(fees),""],["Every signal as futures",inr(bf),cls(bf)],["Every signal as options",inr(bo),cls(bo)]]
+   .map(([l,v,c])=>`<div class="kpi"><div class="l">${l}</div><div class="v ${c}">${v}</div></div>`).join("")});
+ panel("#accts",el=>{if(!guard(el,d.accounts))return;el.innerHTML=d.accounts.map(a=>`<div class="acct"><div class="n">${esc(a.name)} <span class="s">${esc(a.strategy)}</span></div>
+   <div class="big ${cls(a.day_pnl)}">${a.day_pnl>=0?"+":""}${inr(a.day_pnl)}</div><div class="num m" style="font-size:11.5px">${inr(a.equity)} · ${pct(100*(a.equity/(a.capital||500000)-1))}</div>
+   ${spark(a.curve)}<div class="m" style="font-size:11.5px">${a.open} open · ${a.exits} exits (${a.won} won) · fees ${inr(a.fees)}${a.paused?'<span class="badge">PAUSED</span>':""}</div>
+   ${d.role==="control"?`<div class="ctl">${a.paused?`<button class="btn ok" data-act="resume" data-acct="${esc(a.name)}">Resume</button>`:`<button class="btn" data-act="pause" data-acct="${esc(a.name)}">Pause</button>`}${a.open?`<button class="btn danger" data-act="close_all" data-acct="${esc(a.name)}">Close all</button>`:""}</div>`:""}</div>`).join("")});
+ panel("#limits",el=>{if(!guard(el,d.accounts))return;el.innerHTML=`<tr><th>Account</th><th>Daily loss</th><th class="n">Used</th><th>Open</th><th class="n"></th><th>Premium</th><th class="n"></th><th>Give-back</th><th class="n">Streak</th></tr>`+
+  d.accounts.map(a=>{const L=a.limits;return `<tr><td>${esc(a.name)}</td><td>${bar(L.daily_loss.used)}</td><td class="n">${(100*L.daily_loss.used).toFixed(0)}% of ${inr(L.daily_loss.cap)}</td>
+   <td>${bar(L.open.used)}</td><td class="n">${a.open}/${L.open.cap}</td><td>${bar(L.deploy.used)}</td><td class="n">${(100*L.deploy.used).toFixed(0)}% of ${L.deploy.cap}%</td>
+   <td>${L.give_back.halted?'<span class="r">HALTED</span>':L.give_back.peak>=L.give_back.armed_at?'<span class="a">armed</span>':'<span class="m">off</span>'}</td>
+   <td class="n ${L.streak.losses>=3?"r":L.streak.losses>=2?"a":""}">${L.streak.losses}/${L.streak.pause_at}</td></tr>`}).join("")});
+ panel("#books",el=>{if(!guard(el,d.books,"No signals yet today."))return;el.innerHTML=`<tr><th>Book</th><th>Leg</th><th class="n">Trades</th><th class="n">Won</th><th class="n">Open</th><th class="n">Closed</th></tr>`+
+  d.books.map(b=>`<tr><td>${esc(b.book)}</td><td>${b.leg}</td><td class="n">${b.n}</td><td class="n">${b.won}</td><td class="n">${b.open}</td><td class="n ${cls(b.closed_pnl)}">${inr(b.closed_pnl)}</td></tr>`).join("")});
+ panel("#signals",el=>{if(!guard(el,d.signals,"No signals yet today."))return;el.innerHTML=`<tr><th>Time</th><th>Book</th><th>Symbol</th><th>Side</th><th class="n">Entry</th><th>Status</th><th class="n">P&amp;L</th></tr>`+
+  d.signals.map(x=>`<tr><td class="num">${x.time}</td><td>${esc(x.book)}</td><td>${esc(x.symbol)}</td><td class="${x.side==="BUY"?"g":"r"}">${x.side}</td><td class="n">${x.entry.toFixed(2)}</td>
+   <td>${x.status==="OPEN"?'<span class="tag a">OPEN</span>':esc(x.exit)+(x.exit.includes(x.closed)?"":" "+x.closed)}</td><td class="n ${cls(x.pnl)}">${inr(x.pnl)}</td></tr>`).join("")});
+ panel("#fills",el=>{const F=Array.isArray(d.fills)?d.fills:[];const fees=F.reduce((s,f)=>s+(f.fees||0),0),real=F.reduce((s,f)=>s+(f.realized||0),0);
+  $("#tca").textContent=`${F.length} fills · fees ${inr(fees)} · realised ${inr(real)}${real?` · fees = ${(100*fees/Math.max(1,Math.abs(real)+fees)).toFixed(0)}% of gross`:""}`;
+  if(!guard(el,d.fills,"No account fills today."))return;
+  el.innerHTML=`<tr><th>Time</th><th>Acct</th><th>Contract</th><th>Side</th><th class="n">Lots</th><th class="n">Price</th><th class="n">Fees</th><th class="n">Realised</th><th>Reason</th></tr>`+
+  F.map(f=>`<tr><td class="num">${f.time}</td><td>${esc(f.acct)}</td><td>${esc(f.symbol)}</td><td>${f.action}</td><td class="n">${f.lots}</td><td class="n">${f.price.toFixed(2)}</td><td class="n">${inr(f.fees)}</td><td class="n ${cls(f.realized)}">${f.realized?inr(f.realized):""}</td><td class="m">${esc(f.reason)}</td></tr>`).join("")});
+ // risk
+ const R=d.risk||{};
+ panel("#rkpis",el=>{if(bad(R)){guard(el,R);return}const t=(R.exposure||{}).total||{};
+  el.innerHTML=[["Net delta (₹ notional)",inr(t.delta_rs),cls(t.delta_rs)],["Premium at risk",inr(t.premium),""],["Vega (₹ per vol pt)",inr(t.vega),cls(t.vega)],
+   ["Theta (₹ per day)",inr(t.theta),cls(t.theta)],["Unrealised",inr(t.unrealized),cls(t.unrealized)],["In scenarios",`${R.scenario_included||0} of ${(R.positions||[]).length}`,""]]
+   .map(([l,v,c])=>`<div class="kpi"><div class="l">${l}</div><div class="v ${c}">${v}</div></div>`).join("")+(R.stream?"":`<div class="kpi"><div class="l">Live marks</div><div class="v a" style="font-size:14px">stream not running</div></div>`)});
+ panel("#positions",el=>{if(!guard(el,R.positions,"No open positions."))return;el.innerHTML=`<tr><th>Acct</th><th>Contract</th><th class="n">Units</th><th class="n">Entry</th><th class="n">Mark</th><th>Src</th><th class="n">Unreal.</th><th class="n">Peak</th><th class="n">Given back</th><th class="n">Δ</th><th class="n">Vega</th><th class="n">Θ/day</th>${d.role==="control"?"<th></th>":""}</tr>`+
+  R.positions.map(p=>`<tr><td>${esc(p.acct)}</td><td>${esc(p.symbol)}</td><td class="n">${p.units}</td><td class="n">${p.entry.toFixed(2)}</td><td class="n">${p.mark!=null?p.mark.toFixed(2):"—"}</td><td class="m">${p.mark_source}</td>
+   <td class="n ${cls(p.unrealized)}">${inr(p.unrealized)}</td><td class="n ${cls(p.peak_unrealized)}">${inr(p.peak_unrealized)}</td><td class="n ${p.giveback>0?"a":"m"}">${p.giveback!=null?inr(p.giveback):"—"}</td>
+   <td class="n">${p.delta!=null?p.delta.toFixed(1):"—"}</td><td class="n">${p.vega!=null?inr(p.vega):"—"}</td><td class="n">${p.theta!=null?inr(p.theta):"—"}</td>
+   ${d.role==="control"&&p.sid?`<td><button class="btn danger" data-act="close" data-acct="${esc(p.acct)}" data-sid="${esc(p.sid)}" data-label="${esc(p.symbol)}">Close</button></td>`:d.role==="control"?"<td></td>":""}</tr>`).join("")});
+ panel("#grid",el=>{const S=R.scenarios||[];if(!S.length||!R.scenario_included){el.innerHTML='<div class="empty">No open positions with live Greeks. The grid fills when positions are open and the stream is running.</div>';return}
+  const sp=[...new Set(S.map(x=>x.spot))].sort((a,b)=>a-b),iv=[...new Set(S.map(x=>x.iv))].sort((a,b)=>a-b),mx=Math.max(1,...S.map(x=>Math.abs(x.pnl)));
+  const cell=v=>{const a=Math.min(1,Math.abs(v)/mx)*.55;return `<td style="background:${v>=0?`rgba(62,207,142,${a})`:`rgba(255,107,97,${a})`}">${inr(v)}</td>`};
+  el.innerHTML=`<div class="tw"><table class="heat"><tr><th>IV \\ spot</th>${sp.map(m=>`<th class="n">${(m*100).toFixed(0)}%</th>`).join("")}</tr>`+
+   iv.map(v=>`<tr><th>${v>=0?"+":""}${v} vol</th>${sp.map(m=>cell(S.find(x=>x.spot===m&&x.iv===v).pnl)).join("")}</tr>`).join("")+`</table></div>
+   <p class="m" style="font-size:11.5px">Second-order Greeks approximation; it understates very large gaps.${R.scenario_excluded&&R.scenario_excluded.length?" Excluded (no Greeks): "+esc(R.scenario_excluded.join(", ")):""}</p>`});
+ panel("#byund",el=>{const B=((R.exposure||{}).by_underlying)||{};const k=Object.keys(B);if(!k.length){el.innerHTML='<tr><td class="empty">No exposure.</td></tr>';return}
+  el.innerHTML=`<tr><th>Underlying</th><th class="n">Positions</th><th class="n">Net delta ₹</th><th class="n">Premium</th></tr>`+k.map(u=>`<tr><td>${esc(u)}</td><td class="n">${B[u].positions}</td><td class="n ${cls(B[u].delta_rs)}">${inr(B[u].delta_rs)}</td><td class="n">${inr(B[u].premium)}</td></tr>`).join("")});
+ // performance
+ const P=d.performance||{};
+ panel("#curve",el=>{if(bad(P)){guard(el,P);return}const C=P.curves||{},names=Object.keys(C);if(!names.length){el.innerHTML='<div class="empty">No history yet.</div>';return}
+  const cols=["#6ea1ff","#ff6b61","#3ecf8e","#f2b54b","#c58aff","#5fd3e6"],days=[...new Set(names.flatMap(n=>C[n].map(x=>x[0])))].sort();
+  const vals=names.flatMap(n=>C[n].map(x=>x[1])).concat([0]),lo=Math.min(...vals),hi=Math.max(...vals),W=900,H=220,pad=46,sp=(hi-lo)||1;
+  const X=d=>pad+(days.length<2?0:days.indexOf(d)/(days.length-1))*(W-pad-34),Y=v=>H-24-(v-lo)/sp*(H-40);
+  let svg=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block"><line x1="${pad}" x2="${W-10}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--line)" stroke-dasharray="4 4"/>
+   <text x="4" y="${Y(0)+4}" fill="var(--muted)" font-size="11" font-family="var(--mono)">0%</text><text x="4" y="${Y(hi)+10}" fill="var(--muted)" font-size="11" font-family="var(--mono)">${pct(hi,1)}</text><text x="4" y="${Y(lo)}" fill="var(--muted)" font-size="11" font-family="var(--mono)">${pct(lo,1)}</text>`;
+  days.forEach(d=>svg+=`<text x="${X(d)}" y="${H-6}" text-anchor="middle" fill="var(--muted)" font-size="11" font-family="var(--mono)">${d.slice(5)}</text>`);
+  names.forEach((n,i)=>{const pts=C[n].map(x=>`${X(x[0]).toFixed(1)},${Y(x[1]).toFixed(1)}`).join(" ");svg+=`<polyline points="${pts}" fill="none" stroke="${cols[i%6]}" stroke-width="2"/>`+C[n].map(x=>`<circle cx="${X(x[0])}" cy="${Y(x[1])}" r="2.5" fill="${cols[i%6]}"/>`).join("")});
+  el.innerHTML=svg+`</svg><div class="legend">${names.map((n,i)=>`<span><i style="background:${cols[i%6]}"></i>${esc(n)}</span>`).join("")}</div>`});
+ panel("#pstats",el=>{const S=P.stats||{},k=Object.keys(S);if(!k.length){el.innerHTML='<tr><td class="empty">No history.</td></tr>';return}
+  el.innerHTML=`<tr><th>Account</th><th class="n">Days</th><th class="n">Equity</th><th class="n">Since start</th><th class="n">Max drawdown</th><th class="n">Best day</th><th class="n">Worst day</th><th class="n">Positive days</th></tr>`+
+  k.map(a=>{const s=S[a];return `<tr><td>${esc(a)}</td><td class="n">${s.days}</td><td class="n">${inr(s.equity)}</td><td class="n ${cls(s.total_pct)}">${pct(s.total_pct)}</td><td class="n ${s.max_dd_pct<0?"r":"m"}">${s.max_dd_pct.toFixed(2)}%</td><td class="n g">${inr(s.best_day)}</td><td class="n r">${inr(s.worst_day)}</td><td class="n">${s.pos_days} / ${s.days}</td></tr>`}).join("")});
+ // research
+ const RS=d.research||{};
+ panel("#gs",el=>{const g=d.gs||{};if(bad(g)||!g.available){el.innerHTML='<div class="empty">GS store not available.</div>';return}
+  el.innerHTML=`<div class="m" style="margin-bottom:6px">${g.intents} decisions · ${esc(g.days.join(", "))}</div><table><tr><th>Branch</th><th class="n">Fills</th><th class="n">Expired</th><th class="n">Net</th></tr>`+
+  g.branches.map(b=>`<tr><td>${esc(b.branch)}</td><td class="n">${b.fills}</td><td class="n">${b.expired}</td><td class="n ${cls(b.net)}">${b.flat?inr(b.net):'<span class="a">open</span>'}</td></tr>`).join("")+`</table>`});
+ panel("#scalp",el=>{const s=RS.scalp||{};if(bad(s)){guard(el,s);return}if(!s.available){el.innerHTML='<div class="empty">No stream file for this day. SCALP-1 replays the day\'s ticks (locked protocol; prior: FAIL).</div>';return}
+  if(s.deferred){el.innerHTML='<div class="empty">Ticks are being recorded. The SCALP-1 replay runs after 15:20 (it is too heavy to rerun every few minutes in market hours).</div>';return}
+  el.innerHTML=`<table><tr><td>Universe</td><td class="n">${s.universe} stocks</td></tr><tr><td>Signals / orders / fills</td><td class="n">${s.signals} / ${s.orders} / ${s.fills}</td></tr>
+   <tr><td>Trades · hit</td><td class="n">${s.trades} · ${s.hit!=null?(s.hit*100).toFixed(0)+"%":"—"}</td></tr><tr><td>Gross / fees / net per trade</td><td class="n">${s.gross_bp!=null?s.gross_bp.toFixed(1):"—"} / ${s.fee_bp!=null?s.fee_bp.toFixed(1):"—"} / ${s.net_bp!=null?s.net_bp.toFixed(1):"—"} bp</td></tr>
+   <tr><td>Adverse selection 30 s</td><td class="n">${s.adverse_30s_bp!=null?s.adverse_30s_bp.toFixed(1)+" bp":"—"}</td></tr><tr><td>Net today</td><td class="n ${cls(s.net_rs)}">${inr(s.net_rs)} (${(s.unit_bp_per_day||0).toFixed(1)} bp of ₹10 L)</td></tr></table>`});
+ panel("#ovn",el=>{const o=RS.overnight||{};if(bad(o)){guard(el,o);return}const row=(n,x)=>x?`<tr><td>${n}</td><td>${esc(x.day)}</td><td class="m">${esc(x.status)}</td></tr>`:"";
+  const r=o.opx_report||{};el.innerHTML=`<table><tr><th>Track</th><th>Last day</th><th>Status</th></tr>${row("OVN v2",(o.v2||[]).slice(-1)[0])}${row("OVN v3",(o.v3||[]).slice(-1)[0])}${row("OPX-1",(o.opx||[]).slice(-1)[0])}</table>
+   <p class="m" style="font-size:11.5px">OPX-1 pilot: ${r.sessions||0} sessions, gate on ${r.gate_on||0}, entered ${r.opx_entered||0}, net ${inr(r.net_opx_rs)} vs ungated ${inr(r.net_ovn_rs)}.</p>`});
+ panel("#score",el=>{if(!guard(el,d.scorecard))return;const vc={fail:"r",pilot:"a","risk-control":"a","least-bad":"a",skill:"g"};
+  el.innerHTML=`<tr><th>Test</th><th>Result</th><th>Verdict</th><th>Sample</th></tr>`+d.scorecard.map(x=>`<tr><td>${esc(x.test)}</td><td class="num">${esc(x.result)}</td><td class="${vc[x.verdict]||""}">${esc(x.verdict)}</td><td class="m">${esc(x.n)}</td></tr>`).join("")});
+ // system
+ panel("#feeds",el=>{if(!h.up){el.innerHTML=`<div class="empty">Bridge not running (${esc(h.reason||"no answer on :8000")}). Start it with <code>nfce start</code>.</div>`;return}
+  const qb=h.quote_ok_by||{},cb=h.chain_ok_by||{},eg=h.engine||{};const rows=Object.keys({...qb,...cb,...eg}).map(k=>{const qa=age(qb[k]),ca=age(cb[k]);
+   return `<tr><td>${esc(k)}</td><td class="n ${qa!=null&&qa<60?"g":"a"}">${qa!=null?qa+"s":"—"}</td><td class="n ${ca!=null&&ca<120?"g":"a"}">${ca!=null?ca+"s":"—"}</td><td class="m">${esc(eg[k]||"")}</td></tr>`}).join("");
+  el.innerHTML=`<table><tr><th>Feed</th><th class="n">Quote age</th><th class="n">Chain age</th><th>Engine</th></tr>${rows}</table><p class="m" style="font-size:12px">Scanner: ${esc(h.scanner)}<br>Stocks 3m: ${esc(h.stocks3m)}<br>GS: ${esc(h.gs)}<br>Problems: ${esc((h.problems||[]).join("; ")||"none")}</p>`});
+ panel("#stream",el=>{if(bad(st)){guard(el,st);return}if(!st.available){el.innerHTML='<div class="empty">No stream file today. Start <code>ops/stream.py</code> with the recorders.</div>';return}
+  el.innerHTML=`<table><tr><td>Ticks recorded</td><td class="n">${st.ticks.toLocaleString("en-IN")}</td></tr><tr><td>Instruments seen</td><td class="n">${st.keys}</td></tr>
+   <tr><td>Last tick</td><td class="n ${st.age_s<30?"g":"a"}">${st.age_s!=null?Math.round(st.age_s)+" s ago":"—"}</td></tr><tr><td>Latency p50 / p95 (trade → receipt)</td><td class="n">${st.latency_ms_p50!=null?Math.round(st.latency_ms_p50):"—"} / ${st.latency_ms_p95!=null?Math.round(st.latency_ms_p95):"—"} ms</td></tr>
+   <tr><td>Reconnect errors</td><td class="n ${st.errors?"a":""}">${st.errors}</td></tr><tr><td>Book-follow subscriptions</td><td class="n">${st.follow_events}</td></tr></table>${st.last_error?`<p class="err">Last error ${esc(st.last_error[0])}: ${esc(st.last_error[1])}</p>`:""}`});
+ const msgs=a=>(a||[]).map(m=>`<div class="msg"><span class="t">${esc(m.ts)}${m.source?" · "+esc(m.source):""}</span><br>${esc(m.text)}</div>`).join("")||'<div class="empty">None.</div>';
+ panel("#min",el=>{el.innerHTML=bad(d.messages)?`<div class="err">${esc(d.messages.error)}</div>`:msgs((d.messages||{}).in)});
+ panel("#mout",el=>{el.innerHTML=bad(d.messages)?`<div class="err">${esc(d.messages.error)}</div>`:msgs((d.messages||{}).out)});
+}
+let busy=false;
+async function tick(){if(busy)return;busy=true;try{const r=await fetch("/api/all",{cache:"no-store",headers:H()});
+ if(r.status===401){$("#gate").classList.add("on");$("#alerts").innerHTML="";return}if(!r.ok)throw new Error("HTTP "+r.status);render(await r.json())}
+ catch(e){$("#alerts").innerHTML=`<div class="al crit"><b>crit</b>Desk server unreachable: ${esc(e.message)}. Retrying every 5 s.</div>`}finally{busy=false}}
+// ---- Trade tab: 1-second live view, per account; buy (MAN only) and sell ----
+let TSEL="ALL",UNI=null;try{TSEL=localStorage.getItem("desk-tsel")||"ALL"}catch(e){}
+function renderLive(L){if(!L)return;ROLE=L.role;
+ $("#tclock").textContent=`· ${L.generated}`+(L.tick_age_s!=null?` · last option tick ${L.tick_age_s}s ago`:"")+((L.errors||[]).length?` · ⚠ ${L.errors.join("; ")}`:"");
+ const names=["ALL",...L.accounts.map(a=>a.name)];if(!names.includes(TSEL))TSEL="ALL";
+ $("#tsel").innerHTML=names.map(n=>`<button class="chip ${n===TSEL?"on":""}" data-tsel="${esc(n)}">${esc(n==="ALL"?"All accounts":n)}</button>`).join("");
+ const A=L.accounts.filter(a=>TSEL==="ALL"||a.name===TSEL);
+ $("#tkpis").innerHTML=A.map(a=>`<div class="kpi"><div class="l">${esc(a.name)} · ${esc(a.strategy)}</div><div class="v ${cls(a.equity-a.capital)}">${inr(a.equity)}</div>
+   <div class="num m" style="font-size:11.5px">${pct(100*(a.equity/a.capital-1))} since start · cash ${inr(a.cash)} · ${a.open} open · open P&L <span class="${cls(a.unrealized)}">${inr(a.unrealized)}</span></div></div>`).join("");
+ const man=L.accounts.find(a=>a.strategy==="manual");$("#ticketcard").hidden=!(ROLE==="control"&&man);
+ if(ROLE==="control"&&man&&UNI===null){UNI=[];fetch("/api/universe",{headers:H()}).then(r=>r.json()).then(j=>{UNI=j.underlyings||[];$("#tuni").innerHTML=UNI.map(u=>`<option value="${esc(u)}">`).join("")}).catch(()=>{UNI=null})}
+ const P=L.positions.filter(p=>TSEL==="ALL"||p.acct===TSEL);
+ $("#tpos").innerHTML=P.length?`<tr><th>Acct</th><th>Contract</th><th class="n">Units</th><th class="n">Entry</th><th class="n">Bid now</th><th class="n">P&L</th><th class="n">Peak</th><th class="n">Given back</th><th class="n">Held</th><th class="n">Tick</th>${ROLE==="control"?"<th>Sell</th>":""}</tr>`+
+  P.map(p=>{return `<tr><td>${esc(p.acct)}</td><td>${esc(p.symbol)}</td><td class="n">${p.units}</td><td class="n">${p.entry.toFixed(2)}</td><td class="n">${p.mark!=null?p.mark.toFixed(2):"—"}</td>
+   <td class="n ${cls(p.unrealized)}"><b>${inr(p.unrealized)}</b></td><td class="n ${cls(p.peak_unrealized)}">${inr(p.peak_unrealized)}</td><td class="n ${p.giveback>0?"a":"m"}">${p.giveback!=null?inr(p.giveback):"—"}</td>
+   <td class="n ${p.opened&&(Date.now()-Date.parse(p.opened))>=18e5?"a":"m"}" title="30+ min amber: on 28 Oct the 30-min time stop cut every shared loss">${p.opened?Math.floor((Date.now()-Date.parse(p.opened))/6e4)+"m":"—"}</td>
+   <td class="n m">${p.recv_ts?String(Math.max(0,Math.round((Date.now()-Date.parse(p.recv_ts))/1000)))+"s":"—"}</td>
+   ${ROLE==="control"&&p.sid?`<td><div class="sellbox"><input type="number" min="1" placeholder="all" data-lots="${esc(p.sid)}"><button class="btn danger" data-sell="${esc(p.sid)}" data-acct="${esc(p.acct)}" data-label="${esc(p.symbol)}">Sell</button></div></td>`:ROLE==="control"?"<td></td>":""}</tr>`}).join(""):'<tr><td class="empty">No open positions.</td></tr>';
+ const SG=L.signals||[];
+ $("#tsig").innerHTML=SG.length?`<tr><th>Time</th><th>Book</th><th>Underlying</th><th>Side</th><th class="n">Entry</th><th class="n">Stop</th><th class="n">T1</th><th>Check</th><th>Result so far</th>${ROLE==="control"&&man?"<th></th>":""}</tr>`+
+  SG.map(g=>`<tr><td class="m">${esc(g.t)}</td><td class="m">${esc(g.book==="executable"?"index":g.book)}</td><td><b data-chart="${esc(g.underlying)}" style="cursor:pointer;text-decoration:underline dotted" title="show on the chart">${esc(g.underlying)}</b></td><td class="${g.side>0?"g":"r"}">${g.side>0?"BUY":"SELL"}</td>
+   <td class="n">${Number(g.entry).toFixed(2)}</td><td class="n">${Number(g.sl).toFixed(2)}</td><td class="n">${Number(g.t1).toFixed(2)}</td>
+   <td class="${g.check==="NO_DATA"?"a":"m"}">${esc(g.check||"—")}</td><td class="${g.status==="OPEN"?"":cls(g.net_pts)}">${g.status==="OPEN"?"open":esc(g.exit||g.status)+(g.net_pts!=null?` (${g.net_pts>=0?"+":""}${Number(g.net_pts).toFixed(2)} pts)`:"")}</td>
+   ${ROLE==="control"&&man?`<td><button class="btn" data-use="${esc(g.underlying)}" data-side="${g.side}">Use → ${g.side>0?"CALL":"PUT"}</button></td>`:""}</tr>`).join(""):'<tr><td class="empty">No signals yet today.</td></tr>';
+ const F=L.fills.filter(f=>TSEL==="ALL"||f.acct===TSEL);
+ $("#tfills").innerHTML=F.length?`<tr><th>Time</th><th>Acct</th><th>Side</th><th>Contract</th><th class="n">Lots</th><th class="n">Price</th><th class="n">Realised</th><th>Why</th></tr>`+
+  F.map(f=>`<tr><td class="m">${esc(f.t)}</td><td>${esc(f.acct)}</td><td class="${f.action==="BUY"?"g":"r"}">${esc(f.action)}</td><td>${esc(f.symbol)}</td><td class="n">${f.lots}</td><td class="n">${Number(f.price).toFixed(2)}</td>
+   <td class="n ${cls(f.realized)}">${f.action==="SELL"?inr(f.realized):""}</td><td class="m">${esc(f.reason)}</td></tr>`).join(""):'<tr><td class="empty">No trades today.</td></tr>'}
+document.addEventListener("click",e=>{const ch=e.target.closest("[data-chart]");if(ch){setChart(ch.dataset.chart);$("#chart").scrollIntoView({behavior:"smooth",block:"center"});return}
+ const c=e.target.closest("[data-tsel]");if(c){TSEL=c.dataset.tsel;try{localStorage.setItem("desk-tsel",TSEL)}catch(_){}renderLive(LASTL);return}
+ const u=e.target.closest("[data-use]");if(u){setChart(u.dataset.use);$("#tund").value=u.dataset.use;$("#tund").dataset.side=u.dataset.side;
+  const want=u.dataset.side>0?"#tcall":"#tput";["#tcall","#tput"].forEach(x=>$(x).style.outline=x===want?"2px solid var(--accent)":"");
+  $("#ticketcard").scrollIntoView({behavior:"smooth",block:"center"});$("#tlots").focus();return}
+ const s=e.target.closest("[data-sell]");if(s&&ROLE==="control"){const box=document.querySelector(`[data-lots="${CSS.escape(s.dataset.sell)}"]`),n=parseInt(box&&box.value||"0")||0;
+  act({action:"sell",acct:s.dataset.acct,sid:s.dataset.sell,lots:n||""},`SELL ${n?n+" lot(s)":"ALL lots"} of ${s.dataset.label} in ${s.dataset.acct} now at the live bid?\n(Logged as MANUAL.)`)}});
+function order(side){const u=$("#tund").value.trim().toUpperCase(),n=parseInt($("#tlots").value)||0,man=(LASTL&&LASTL.accounts.find(a=>a.strategy==="manual")||{}).name;
+ if(!u||n<1||!man){alert("Pick an underlying and at least 1 lot.");return}
+ act({action:"buy",acct:man,underlying:u,side:side,lots:n},`BUY ${n} lot(s) of the 1-ITM ${u} ${side>0?"CALL":"PUT"} in ${man} at the ask now?`)}
+$("#tcall").onclick=()=>order(1);$("#tput").onclick=()=>order(-1);
+let CU="NIFTY",cbusy=false;try{CU=localStorage.getItem("desk-cu")||"NIFTY"}catch(e){}
+function drawChart(D){const el=$("#chart");if(!D||D.error){el.innerHTML=`<div class="empty">${esc(D&&D.error||"no data")}</div>`;$("#cread").textContent="";return}
+ const B=D.bars;if(!B.length){el.innerHTML='<div class="empty">No ticks yet today.</div>';return}
+ const W=900,H=300,R=70,pl=8,pr=58,n=B.length,xs=(W-pl-pr)/Math.max(n,1),X=i=>pl+i*xs+xs/2;
+ const vals=B.flatMap(b=>[b.h,b.l]).concat(D.signals.flatMap(g=>[g.sl,g.t1]));const lo=Math.min(...vals),hi=Math.max(...vals),sp=(hi-lo)||1,Y=v=>8+(hi-v)/sp*(H-16);
+ const line=(arr,col,w)=>{let d="";arr.forEach((v,i)=>{if(v==null)return;d+=(d?"L":"M")+X(i).toFixed(1)+","+Y(v).toFixed(1)});return d?`<path d="${d}" fill="none" stroke="${col}" stroke-width="${w}"/>`:""};
+ let svg=`<svg viewBox="0 0 ${W} ${H+R+18}" width="100%" style="display:block;background:var(--sunk);border-radius:8px">`;
+ for(let k=0;k<=4;k++){const v=lo+sp*k/4;svg+=`<line x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--line)"/><text x="${W-pr+4}" y="${Y(v)+4}" fill="var(--muted)" font-size="10" font-family="var(--mono)">${v.toFixed(v>1000?0:2)}</text>`}
+ B.forEach((b,i)=>{const up=b.c>=b.o,c=up?"var(--gain)":"var(--loss)",bw=Math.max(1,xs*.7);
+  svg+=`<line x1="${X(i)}" x2="${X(i)}" y1="${Y(b.h)}" y2="${Y(b.l)}" stroke="${c}"/><rect x="${X(i)-bw/2}" y="${Y(Math.max(b.o,b.c))}" width="${bw}" height="${Math.max(1,Math.abs(Y(b.o)-Y(b.c)))}" fill="${c}"/>`});
+ svg+=line(D.vwap,"#f2b54b",1.6)+line(D.ema9,"#6ea1ff",1.2)+line(D.ema21,"#c58aff",1.2);
+ const ix=t=>{const k=B.findIndex(b=>b.t>=t);return k<0?n-1:k};
+ D.signals.forEach(g=>{const i=ix(g.t),x0=X(i),x1=W-pr;
+  svg+=`<line x1="${x0}" x2="${x1}" y1="${Y(g.t1)}" y2="${Y(g.t1)}" stroke="#3ecf8e" stroke-dasharray="4 3"/><line x1="${x0}" x2="${x1}" y1="${Y(g.sl)}" y2="${Y(g.sl)}" stroke="#ff6b61" stroke-dasharray="4 3"/>
+   <path d="M${x0},${Y(g.entry)+(g.side>0?12:-12)} l-5,${g.side>0?7:-7} l10,0 z" fill="${g.side>0?"var(--gain)":"var(--loss)"}" transform="translate(0,${g.side>0?-2:2})"/>
+   <text x="${x0+4}" y="${Y(g.entry)+(g.side>0?24:-16)}" fill="var(--muted)" font-size="10" font-family="var(--mono)">${g.t} ${g.side>0?"BUY":"SELL"}</text>`});
+ const ry=v=>H+10+(100-v)/100*R;svg+=`<line x1="${pl}" x2="${W-pr}" y1="${ry(70)}" y2="${ry(70)}" stroke="var(--line)" stroke-dasharray="2 3"/><line x1="${pl}" x2="${W-pr}" y1="${ry(30)}" y2="${ry(30)}" stroke="var(--line)" stroke-dasharray="2 3"/>`;
+ let rd="";D.rsi.forEach((v,i)=>{if(v==null)return;rd+=(rd?"L":"M")+X(i).toFixed(1)+","+ry(v).toFixed(1)});svg+=`<path d="${rd}" fill="none" stroke="#5fd3e6" stroke-width="1.2"/><text x="${W-pr+4}" y="${ry(50)+4}" fill="var(--muted)" font-size="10" font-family="var(--mono)">RSI</text>`;
+ [0,Math.floor(n/2),n-1].forEach(i=>svg+=`<text x="${X(i)}" y="${H+R+16}" text-anchor="middle" fill="var(--muted)" font-size="10" font-family="var(--mono)">${B[i].t}</text>`);
+ el.innerHTML=svg+"</svg>";
+ const r=D.rsi[n-1],e9=D.ema9[n-1],e21=D.ema21[n-1],vw=D.vwap[n-1];
+ $("#cread").textContent=`${D.underlying} ${D.last.toFixed(2)} (${D.chg_pct>=0?"+":""}${D.chg_pct.toFixed(2)}%) · day ${D.day_low.toFixed(2)}–${D.day_high.toFixed(2)} · EMA9 ${e9>e21?"above":"below"} EMA21 · RSI ${r!=null?r.toFixed(0):"—"}`+(vw!=null?` · price ${D.last>vw?"above":"below"} VWAP ${vw.toFixed(2)}`:"")}
+async function chartTick(){if(cbusy||tab!=="trade")return;cbusy=true;try{const r=await fetch("/api/chart?u="+encodeURIComponent(CU),{cache:"no-store",headers:H()});drawChart(await r.json())}catch(e){}finally{cbusy=false}}
+function setChart(u){CU=u.trim().toUpperCase()||"NIFTY";$("#cund").value=CU;try{localStorage.setItem("desk-cu",CU)}catch(e){}chartTick()}
+$("#cgo").onclick=()=>setChart($("#cund").value);$("#cund").value=CU;setInterval(chartTick,5000);
+let LASTL=null,lbusy=false;
+async function liveTick(){if(lbusy||tab!=="trade")return;lbusy=true;try{const r=await fetch("/api/live",{cache:"no-store",headers:H()});if(r.ok){LASTL=await r.json();renderLive(LASTL)}}catch(e){}finally{lbusy=false}}
+setInterval(liveTick,1000);
+$("#tokgo").onclick=()=>{TOKEN=$("#tok").value.trim();try{localStorage.setItem("desk-token",TOKEN)}catch(e){}tick()};
+tick();setInterval(tick,5000);
+</script></body></html>
